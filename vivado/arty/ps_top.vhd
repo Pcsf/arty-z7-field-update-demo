@@ -1,0 +1,465 @@
+-- ps_top.vhd — PS7-based top for the Arty Z7-20. THE SHIPPED DESIGN.
+--
+--   ps_bd_wrapper ─ M_AXI_GP0 (AXI3, 12-bit IDs) ─ axi_pc_0 ─ AXI4-Lite ─ blinkctl_axil ─ led_o[3:0]
+--        └─ FCLK_CLK0 (125 MHz) ──────────────────┴─────────────────────────┘
+--        └─ FCLK_RESET0_N ────────────────────────┴─────────────────────────┘
+--
+-- This is the design that ships inside BOOT.BIN. Unlike bench_top, the bus
+-- master is the CPU rather than the JTAG cable: the applications reach blinkctl
+-- with Xil_In32/Xil_Out32 over GP0, and the FSBL loads this bitstream
+-- out of flash.
+--
+-- WHY THERE IS A BLOCK DESIGN
+--
+-- The PS7 sits in a block design (ps_bd) containing nothing else. Not for
+-- wiring convenience — the fabric below is still plain RTL — but because
+-- write_hw_platform derives its .hwh hardware handoff from a block design.
+-- Exporting an XSA from a pure-RTL PS design produces an archive holding only
+-- the bitstream: PlatformState="pre_synth", no address map, no ps7_init, and
+-- nothing Vitis can build a bare-metal platform or an FSBL from. Verified on
+-- 2021.2 before this design was restructured.
+--
+-- Keeping blinkctl out of the block design means it does not appear in
+-- xparameters.h. That is deliberate: doc/icd_blinkctl.md is the source of truth
+-- for the register map, and software uses 0x43C0_0000 from there — the same
+-- address the bench design has always used.
+--
+-- WHY A PROTOCOL CONVERTER
+--
+-- M_AXI_GP0 is AXI3: burst length, lock, cache, QoS, WLAST/RLAST and 12-bit
+-- transaction IDs. blinkctl_axil is AXI4-Lite, which has none of those.
+-- bench_top could wire master to slave directly only because JTAG-to-AXI can be
+-- configured as AXI4-Lite outright (CONFIG.PROTOCOL=2); the PS has no such
+-- option, so the conversion happens in the fabric.
+--
+-- The converter's ID_WIDTH is 12, set in project.mk, and that is not optional.
+-- Left at its default of 0 the IP exposes no s_axi_*id ports at all, which
+-- would leave the PS's BID/RID inputs to be tied off by hand — and AXI requires
+-- a response to carry the ID of the request that caused it. The converter
+-- absorbs each ID and echoes it, so nothing here has to.
+--
+-- CLOCKING AND RESET
+--
+-- FCLK_CLK0 is overridden to 125 MHz in project.mk. Digilent's preset asks for
+-- 100, but doc/icd_blinkctl.md specifies 125 MHz on the Arty and the v1/v2
+-- divider constants are computed for it; overriding keeps one ICD and one set
+-- of payload constants across both designs.
+--
+-- No power-on reset counter, unlike bench_top: the PS supplies FCLK_RESET0_N,
+-- already active-low and synchronous to FCLK_CLK0, which is what the AXI
+-- aresetn convention wants. bench_top only invented one because it had no PS.
+--
+-- BRINGING IT UP ON HARDWARE
+--
+-- Programming this bitstream over JTAG alone leaves the LED static, and that is
+-- not a fault: FCLK_CLK0 comes from the PS PLLs, which ps7_init configures. See
+-- README, "Programming the PS design", for the xsct sequence.
+--
+-- ADDRESSING
+--
+-- No address decoder, matching bench_top. GP0 occupies 0x4000_0000-0x7FFF_FFFF
+-- on Zynq-7000, so the ICD's 0x43C0_0000 lands in the fabric; blinkctl decodes
+-- addr(5 downto 2) only, so the ICD offsets work as written and alias every 64
+-- bytes within that window.
+--
+-- The DDR and FIXED_IO ports are the PS7's dedicated pins. They must appear at
+-- the top level for the PS to be reachable, but take no XDC constraints — the
+-- pins are hard silicon, not fabric I/O. That is why vivado/arty/arty_z7.xdc
+-- constrains LEDs only and declares no clock.
+
+library ieee;
+use ieee.std_logic_1164.all;
+
+entity ps_top is
+  generic (
+    G_VERSION       : std_logic_vector(31 downto 0) := x"00010001";
+    G_BLINK_DIV_RST : natural                       := 125_000_000
+  );
+  port (
+    DDR_addr            : inout std_logic_vector(14 downto 0);
+    DDR_ba              : inout std_logic_vector(2 downto 0);
+    DDR_cas_n           : inout std_logic;
+    DDR_ck_n            : inout std_logic;
+    DDR_ck_p            : inout std_logic;
+    DDR_cke             : inout std_logic;
+    DDR_cs_n            : inout std_logic;
+    DDR_dm              : inout std_logic_vector(3 downto 0);
+    DDR_dq              : inout std_logic_vector(31 downto 0);
+    DDR_dqs_n           : inout std_logic_vector(3 downto 0);
+    DDR_dqs_p           : inout std_logic_vector(3 downto 0);
+    DDR_odt             : inout std_logic;
+    DDR_ras_n           : inout std_logic;
+    DDR_reset_n         : inout std_logic;
+    DDR_we_n            : inout std_logic;
+    FIXED_IO_ddr_vrn    : inout std_logic;
+    FIXED_IO_ddr_vrp    : inout std_logic;
+    FIXED_IO_mio        : inout std_logic_vector(53 downto 0);
+    FIXED_IO_ps_clk     : inout std_logic;
+    FIXED_IO_ps_porb    : inout std_logic;
+    FIXED_IO_ps_srstb   : inout std_logic;
+
+    led_o               : out   std_logic_vector(3 downto 0)
+  );
+end entity ps_top;
+
+architecture rtl of ps_top is
+
+  -- Generated by make_wrapper from ps_bd. The _0 suffixes are what
+  -- make_bd_intf_pins_external/make_bd_pins_external name their ports.
+  component ps_bd_wrapper is
+    port (
+      DDR_0_addr          : inout std_logic_vector(14 downto 0);
+      DDR_0_ba            : inout std_logic_vector(2 downto 0);
+      DDR_0_cas_n         : inout std_logic;
+      DDR_0_ck_n          : inout std_logic;
+      DDR_0_ck_p          : inout std_logic;
+      DDR_0_cke           : inout std_logic;
+      DDR_0_cs_n          : inout std_logic;
+      DDR_0_dm            : inout std_logic_vector(3 downto 0);
+      DDR_0_dq            : inout std_logic_vector(31 downto 0);
+      DDR_0_dqs_n         : inout std_logic_vector(3 downto 0);
+      DDR_0_dqs_p         : inout std_logic_vector(3 downto 0);
+      DDR_0_odt           : inout std_logic;
+      DDR_0_ras_n         : inout std_logic;
+      DDR_0_reset_n       : inout std_logic;
+      DDR_0_we_n          : inout std_logic;
+      FCLK_CLK0_0         : out   std_logic;
+      FCLK_RESET0_N_0     : out   std_logic;
+      FIXED_IO_0_ddr_vrn  : inout std_logic;
+      FIXED_IO_0_ddr_vrp  : inout std_logic;
+      FIXED_IO_0_mio      : inout std_logic_vector(53 downto 0);
+      FIXED_IO_0_ps_clk   : inout std_logic;
+      FIXED_IO_0_ps_porb  : inout std_logic;
+      FIXED_IO_0_ps_srstb : inout std_logic;
+      M_AXI_GP0_0_araddr  : out   std_logic_vector(31 downto 0);
+      M_AXI_GP0_0_arburst : out   std_logic_vector(1 downto 0);
+      M_AXI_GP0_0_arcache : out   std_logic_vector(3 downto 0);
+      M_AXI_GP0_0_arid    : out   std_logic_vector(11 downto 0);
+      M_AXI_GP0_0_arlen   : out   std_logic_vector(3 downto 0);
+      M_AXI_GP0_0_arlock  : out   std_logic_vector(1 downto 0);
+      M_AXI_GP0_0_arprot  : out   std_logic_vector(2 downto 0);
+      M_AXI_GP0_0_arqos   : out   std_logic_vector(3 downto 0);
+      M_AXI_GP0_0_arready : in    std_logic;
+      M_AXI_GP0_0_arsize  : out   std_logic_vector(2 downto 0);
+      M_AXI_GP0_0_arvalid : out   std_logic;
+      M_AXI_GP0_0_awaddr  : out   std_logic_vector(31 downto 0);
+      M_AXI_GP0_0_awburst : out   std_logic_vector(1 downto 0);
+      M_AXI_GP0_0_awcache : out   std_logic_vector(3 downto 0);
+      M_AXI_GP0_0_awid    : out   std_logic_vector(11 downto 0);
+      M_AXI_GP0_0_awlen   : out   std_logic_vector(3 downto 0);
+      M_AXI_GP0_0_awlock  : out   std_logic_vector(1 downto 0);
+      M_AXI_GP0_0_awprot  : out   std_logic_vector(2 downto 0);
+      M_AXI_GP0_0_awqos   : out   std_logic_vector(3 downto 0);
+      M_AXI_GP0_0_awready : in    std_logic;
+      M_AXI_GP0_0_awsize  : out   std_logic_vector(2 downto 0);
+      M_AXI_GP0_0_awvalid : out   std_logic;
+      M_AXI_GP0_0_bid     : in    std_logic_vector(11 downto 0);
+      M_AXI_GP0_0_bready  : out   std_logic;
+      M_AXI_GP0_0_bresp   : in    std_logic_vector(1 downto 0);
+      M_AXI_GP0_0_bvalid  : in    std_logic;
+      M_AXI_GP0_0_rdata   : in    std_logic_vector(31 downto 0);
+      M_AXI_GP0_0_rid     : in    std_logic_vector(11 downto 0);
+      M_AXI_GP0_0_rlast   : in    std_logic;
+      M_AXI_GP0_0_rready  : out   std_logic;
+      M_AXI_GP0_0_rresp   : in    std_logic_vector(1 downto 0);
+      M_AXI_GP0_0_rvalid  : in    std_logic;
+      M_AXI_GP0_0_wdata   : out   std_logic_vector(31 downto 0);
+      M_AXI_GP0_0_wid     : out   std_logic_vector(11 downto 0);
+      M_AXI_GP0_0_wlast   : out   std_logic;
+      M_AXI_GP0_0_wready  : in    std_logic;
+      M_AXI_GP0_0_wstrb   : out   std_logic_vector(3 downto 0);
+      M_AXI_GP0_0_wvalid  : out   std_logic
+      );
+  end component ps_bd_wrapper;
+
+  component axi_pc_0 is
+    port (
+      aclk          : in  std_logic;
+      aresetn       : in  std_logic;
+      s_axi_awid    : in  std_logic_vector(11 downto 0);
+      s_axi_awaddr  : in  std_logic_vector(31 downto 0);
+      s_axi_awlen   : in  std_logic_vector(3 downto 0);
+      s_axi_awsize  : in  std_logic_vector(2 downto 0);
+      s_axi_awburst : in  std_logic_vector(1 downto 0);
+      s_axi_awlock  : in  std_logic_vector(1 downto 0);
+      s_axi_awcache : in  std_logic_vector(3 downto 0);
+      s_axi_awprot  : in  std_logic_vector(2 downto 0);
+      s_axi_awqos   : in  std_logic_vector(3 downto 0);
+      s_axi_awvalid : in  std_logic;
+      s_axi_awready : out std_logic;
+      s_axi_wid     : in  std_logic_vector(11 downto 0);
+      s_axi_wdata   : in  std_logic_vector(31 downto 0);
+      s_axi_wstrb   : in  std_logic_vector(3 downto 0);
+      s_axi_wlast   : in  std_logic;
+      s_axi_wvalid  : in  std_logic;
+      s_axi_wready  : out std_logic;
+      s_axi_bid     : out std_logic_vector(11 downto 0);
+      s_axi_bresp   : out std_logic_vector(1 downto 0);
+      s_axi_bvalid  : out std_logic;
+      s_axi_bready  : in  std_logic;
+      s_axi_arid    : in  std_logic_vector(11 downto 0);
+      s_axi_araddr  : in  std_logic_vector(31 downto 0);
+      s_axi_arlen   : in  std_logic_vector(3 downto 0);
+      s_axi_arsize  : in  std_logic_vector(2 downto 0);
+      s_axi_arburst : in  std_logic_vector(1 downto 0);
+      s_axi_arlock  : in  std_logic_vector(1 downto 0);
+      s_axi_arcache : in  std_logic_vector(3 downto 0);
+      s_axi_arprot  : in  std_logic_vector(2 downto 0);
+      s_axi_arqos   : in  std_logic_vector(3 downto 0);
+      s_axi_arvalid : in  std_logic;
+      s_axi_arready : out std_logic;
+      s_axi_rid     : out std_logic_vector(11 downto 0);
+      s_axi_rdata   : out std_logic_vector(31 downto 0);
+      s_axi_rresp   : out std_logic_vector(1 downto 0);
+      s_axi_rlast   : out std_logic;
+      s_axi_rvalid  : out std_logic;
+      s_axi_rready  : in  std_logic;
+      m_axi_awaddr  : out std_logic_vector(31 downto 0);
+      m_axi_awprot  : out std_logic_vector(2 downto 0);
+      m_axi_awvalid : out std_logic;
+      m_axi_awready : in  std_logic;
+      m_axi_wdata   : out std_logic_vector(31 downto 0);
+      m_axi_wstrb   : out std_logic_vector(3 downto 0);
+      m_axi_wvalid  : out std_logic;
+      m_axi_wready  : in  std_logic;
+      m_axi_bresp   : in  std_logic_vector(1 downto 0);
+      m_axi_bvalid  : in  std_logic;
+      m_axi_bready  : out std_logic;
+      m_axi_araddr  : out std_logic_vector(31 downto 0);
+      m_axi_arprot  : out std_logic_vector(2 downto 0);
+      m_axi_arvalid : out std_logic;
+      m_axi_arready : in  std_logic;
+      m_axi_rdata   : in  std_logic_vector(31 downto 0);
+      m_axi_rresp   : in  std_logic_vector(1 downto 0);
+      m_axi_rvalid  : in  std_logic;
+      m_axi_rready  : out std_logic
+      );
+  end component axi_pc_0;
+
+  signal fclk_clk0     : std_logic;
+  signal fclk_reset0_n : std_logic;
+
+  -- AXI3: PS -> converter
+  signal gp0_awid    : std_logic_vector(11 downto 0);
+  signal gp0_awaddr  : std_logic_vector(31 downto 0);
+  signal gp0_awlen   : std_logic_vector(3 downto 0);
+  signal gp0_awsize  : std_logic_vector(2 downto 0);
+  signal gp0_awburst : std_logic_vector(1 downto 0);
+  signal gp0_awlock  : std_logic_vector(1 downto 0);
+  signal gp0_awcache : std_logic_vector(3 downto 0);
+  signal gp0_awprot  : std_logic_vector(2 downto 0);
+  signal gp0_awqos   : std_logic_vector(3 downto 0);
+  signal gp0_awvalid : std_logic;
+  signal gp0_awready : std_logic;
+  signal gp0_wid     : std_logic_vector(11 downto 0);
+  signal gp0_wdata   : std_logic_vector(31 downto 0);
+  signal gp0_wstrb   : std_logic_vector(3 downto 0);
+  signal gp0_wlast   : std_logic;
+  signal gp0_wvalid  : std_logic;
+  signal gp0_wready  : std_logic;
+  signal gp0_bid     : std_logic_vector(11 downto 0);
+  signal gp0_bresp   : std_logic_vector(1 downto 0);
+  signal gp0_bvalid  : std_logic;
+  signal gp0_bready  : std_logic;
+  signal gp0_arid    : std_logic_vector(11 downto 0);
+  signal gp0_araddr  : std_logic_vector(31 downto 0);
+  signal gp0_arlen   : std_logic_vector(3 downto 0);
+  signal gp0_arsize  : std_logic_vector(2 downto 0);
+  signal gp0_arburst : std_logic_vector(1 downto 0);
+  signal gp0_arlock  : std_logic_vector(1 downto 0);
+  signal gp0_arcache : std_logic_vector(3 downto 0);
+  signal gp0_arprot  : std_logic_vector(2 downto 0);
+  signal gp0_arqos   : std_logic_vector(3 downto 0);
+  signal gp0_arvalid : std_logic;
+  signal gp0_arready : std_logic;
+  signal gp0_rid     : std_logic_vector(11 downto 0);
+  signal gp0_rdata   : std_logic_vector(31 downto 0);
+  signal gp0_rresp   : std_logic_vector(1 downto 0);
+  signal gp0_rlast   : std_logic;
+  signal gp0_rvalid  : std_logic;
+  signal gp0_rready  : std_logic;
+
+  -- AXI4-Lite: converter -> blinkctl_axil
+  signal lite_awaddr  : std_logic_vector(31 downto 0);
+  signal lite_awprot  : std_logic_vector(2 downto 0);
+  signal lite_awvalid : std_logic;
+  signal lite_awready : std_logic;
+  signal lite_wdata   : std_logic_vector(31 downto 0);
+  signal lite_wstrb   : std_logic_vector(3 downto 0);
+  signal lite_wvalid  : std_logic;
+  signal lite_wready  : std_logic;
+  signal lite_bresp   : std_logic_vector(1 downto 0);
+  signal lite_bvalid  : std_logic;
+  signal lite_bready  : std_logic;
+  signal lite_araddr  : std_logic_vector(31 downto 0);
+  signal lite_arprot  : std_logic_vector(2 downto 0);
+  signal lite_arvalid : std_logic;
+  signal lite_arready : std_logic;
+  signal lite_rdata   : std_logic_vector(31 downto 0);
+  signal lite_rresp   : std_logic_vector(1 downto 0);
+  signal lite_rvalid  : std_logic;
+  signal lite_rready  : std_logic;
+
+begin
+
+  PS : ps_bd_wrapper
+    port map (
+      DDR_0_addr          => DDR_addr,
+      DDR_0_ba            => DDR_ba,
+      DDR_0_cas_n         => DDR_cas_n,
+      DDR_0_ck_n          => DDR_ck_n,
+      DDR_0_ck_p          => DDR_ck_p,
+      DDR_0_cke           => DDR_cke,
+      DDR_0_cs_n          => DDR_cs_n,
+      DDR_0_dm            => DDR_dm,
+      DDR_0_dq            => DDR_dq,
+      DDR_0_dqs_n         => DDR_dqs_n,
+      DDR_0_dqs_p         => DDR_dqs_p,
+      DDR_0_odt           => DDR_odt,
+      DDR_0_ras_n         => DDR_ras_n,
+      DDR_0_reset_n       => DDR_reset_n,
+      DDR_0_we_n          => DDR_we_n,
+      FCLK_CLK0_0         => fclk_clk0,
+      FCLK_RESET0_N_0     => fclk_reset0_n,
+      FIXED_IO_0_ddr_vrn  => FIXED_IO_ddr_vrn,
+      FIXED_IO_0_ddr_vrp  => FIXED_IO_ddr_vrp,
+      FIXED_IO_0_mio      => FIXED_IO_mio,
+      FIXED_IO_0_ps_clk   => FIXED_IO_ps_clk,
+      FIXED_IO_0_ps_porb  => FIXED_IO_ps_porb,
+      FIXED_IO_0_ps_srstb => FIXED_IO_ps_srstb,
+      M_AXI_GP0_0_awid    => gp0_awid,
+      M_AXI_GP0_0_awaddr  => gp0_awaddr,
+      M_AXI_GP0_0_awlen   => gp0_awlen,
+      M_AXI_GP0_0_awsize  => gp0_awsize,
+      M_AXI_GP0_0_awburst => gp0_awburst,
+      M_AXI_GP0_0_awlock  => gp0_awlock,
+      M_AXI_GP0_0_awcache => gp0_awcache,
+      M_AXI_GP0_0_awprot  => gp0_awprot,
+      M_AXI_GP0_0_awqos   => gp0_awqos,
+      M_AXI_GP0_0_awvalid => gp0_awvalid,
+      M_AXI_GP0_0_awready => gp0_awready,
+      M_AXI_GP0_0_wid     => gp0_wid,
+      M_AXI_GP0_0_wdata   => gp0_wdata,
+      M_AXI_GP0_0_wstrb   => gp0_wstrb,
+      M_AXI_GP0_0_wlast   => gp0_wlast,
+      M_AXI_GP0_0_wvalid  => gp0_wvalid,
+      M_AXI_GP0_0_wready  => gp0_wready,
+      M_AXI_GP0_0_bid     => gp0_bid,
+      M_AXI_GP0_0_bresp   => gp0_bresp,
+      M_AXI_GP0_0_bvalid  => gp0_bvalid,
+      M_AXI_GP0_0_bready  => gp0_bready,
+      M_AXI_GP0_0_arid    => gp0_arid,
+      M_AXI_GP0_0_araddr  => gp0_araddr,
+      M_AXI_GP0_0_arlen   => gp0_arlen,
+      M_AXI_GP0_0_arsize  => gp0_arsize,
+      M_AXI_GP0_0_arburst => gp0_arburst,
+      M_AXI_GP0_0_arlock  => gp0_arlock,
+      M_AXI_GP0_0_arcache => gp0_arcache,
+      M_AXI_GP0_0_arprot  => gp0_arprot,
+      M_AXI_GP0_0_arqos   => gp0_arqos,
+      M_AXI_GP0_0_arvalid => gp0_arvalid,
+      M_AXI_GP0_0_arready => gp0_arready,
+      M_AXI_GP0_0_rid     => gp0_rid,
+      M_AXI_GP0_0_rdata   => gp0_rdata,
+      M_AXI_GP0_0_rresp   => gp0_rresp,
+      M_AXI_GP0_0_rlast   => gp0_rlast,
+      M_AXI_GP0_0_rvalid  => gp0_rvalid,
+      M_AXI_GP0_0_rready  => gp0_rready
+      );
+
+  -- AXI3 -> AXI4-Lite. Absorbs burst, lock, cache, QoS and WLAST/RLAST, and
+  -- echoes each transaction ID back on its response.
+  CONV : axi_pc_0
+    port map (
+      aclk          => fclk_clk0,
+      aresetn       => fclk_reset0_n,
+      s_axi_awid    => gp0_awid,
+      s_axi_awaddr  => gp0_awaddr,
+      s_axi_awlen   => gp0_awlen,
+      s_axi_awsize  => gp0_awsize,
+      s_axi_awburst => gp0_awburst,
+      s_axi_awlock  => gp0_awlock,
+      s_axi_awcache => gp0_awcache,
+      s_axi_awprot  => gp0_awprot,
+      s_axi_awqos   => gp0_awqos,
+      s_axi_awvalid => gp0_awvalid,
+      s_axi_awready => gp0_awready,
+      s_axi_wid     => gp0_wid,
+      s_axi_wdata   => gp0_wdata,
+      s_axi_wstrb   => gp0_wstrb,
+      s_axi_wlast   => gp0_wlast,
+      s_axi_wvalid  => gp0_wvalid,
+      s_axi_wready  => gp0_wready,
+      s_axi_bid     => gp0_bid,
+      s_axi_bresp   => gp0_bresp,
+      s_axi_bvalid  => gp0_bvalid,
+      s_axi_bready  => gp0_bready,
+      s_axi_arid    => gp0_arid,
+      s_axi_araddr  => gp0_araddr,
+      s_axi_arlen   => gp0_arlen,
+      s_axi_arsize  => gp0_arsize,
+      s_axi_arburst => gp0_arburst,
+      s_axi_arlock  => gp0_arlock,
+      s_axi_arcache => gp0_arcache,
+      s_axi_arprot  => gp0_arprot,
+      s_axi_arqos   => gp0_arqos,
+      s_axi_arvalid => gp0_arvalid,
+      s_axi_arready => gp0_arready,
+      s_axi_rid     => gp0_rid,
+      s_axi_rdata   => gp0_rdata,
+      s_axi_rresp   => gp0_rresp,
+      s_axi_rlast   => gp0_rlast,
+      s_axi_rvalid  => gp0_rvalid,
+      s_axi_rready  => gp0_rready,
+      m_axi_awaddr  => lite_awaddr,
+      m_axi_awprot  => lite_awprot,
+      m_axi_awvalid => lite_awvalid,
+      m_axi_awready => lite_awready,
+      m_axi_wdata   => lite_wdata,
+      m_axi_wstrb   => lite_wstrb,
+      m_axi_wvalid  => lite_wvalid,
+      m_axi_wready  => lite_wready,
+      m_axi_bresp   => lite_bresp,
+      m_axi_bvalid  => lite_bvalid,
+      m_axi_bready  => lite_bready,
+      m_axi_araddr  => lite_araddr,
+      m_axi_arprot  => lite_arprot,
+      m_axi_arvalid => lite_arvalid,
+      m_axi_arready => lite_arready,
+      m_axi_rdata   => lite_rdata,
+      m_axi_rresp   => lite_rresp,
+      m_axi_rvalid  => lite_rvalid,
+      m_axi_rready  => lite_rready
+      );
+
+  PAYLOAD : entity work.blinkctl_axil
+    generic map (
+      G_VERSION       => G_VERSION,
+      G_BLINK_DIV_RST => G_BLINK_DIV_RST
+      )
+    port map (
+      s_axi_aclk    => fclk_clk0,
+      s_axi_aresetn => fclk_reset0_n,
+      s_axi_awaddr  => lite_awaddr,
+      s_axi_awprot  => lite_awprot,
+      s_axi_awvalid => lite_awvalid,
+      s_axi_awready => lite_awready,
+      s_axi_wdata   => lite_wdata,
+      s_axi_wstrb   => lite_wstrb,
+      s_axi_wvalid  => lite_wvalid,
+      s_axi_wready  => lite_wready,
+      s_axi_bresp   => lite_bresp,
+      s_axi_bvalid  => lite_bvalid,
+      s_axi_bready  => lite_bready,
+      s_axi_araddr  => lite_araddr,
+      s_axi_arprot  => lite_arprot,
+      s_axi_arvalid => lite_arvalid,
+      s_axi_arready => lite_arready,
+      s_axi_rdata   => lite_rdata,
+      s_axi_rresp   => lite_rresp,
+      s_axi_rvalid  => lite_rvalid,
+      s_axi_rready  => lite_rready,
+      led_o         => led_o
+      );
+
+end architecture rtl;

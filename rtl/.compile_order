@@ -1,0 +1,5 @@
+# blinkctl VHDL compile order
+# package before entity/architecture
+blinkctl_pkg.vhd
+blinkctl.vhd
+blinkctl_axil.vhd

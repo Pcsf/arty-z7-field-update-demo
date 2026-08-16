@@ -1,0 +1,36 @@
+#+TITLE: Standalone examples — one mechanism each
+#+OPTIONS: toc:nil num:nil
+
+*Nothing in the demo builds from this directory.* You can delete it and every
+target in the top-level README still works. It is here because these are the
+fastest way to get one mechanism working on your own board, with nothing else in
+the way to confuse the result.
+
+Each application consumes ~sw/lib/~ exactly as the demo does — in parallel with
+it, never as a stage of it.
+
+| Example       | Proves                                                               |
+|---------------+----------------------------------------------------------------------|
+| ~regs~        | the PS reaching a PL peripheral over ~M_AXI_GP0~                     |
+| ~lwip_echo~   | Ethernet up under lwIP with ~NO_SYS=1~                               |
+| ~tftp_client~ | fetching a file into DDR over TFTP                                   |
+| ~qspi~        | erase / program / read-back against the real part, with a write guard |
+| ~sha256~      | hashing a large buffer in chunks                                     |
+| ~multiboot~   | arming the MultiBoot register, soft-resetting, landing elsewhere     |
+| ~multiboot_b~ | the other half of that pair — the image you land /on/                |
+
+* Running one
+
+#+begin_src sh
+make DESIGN=ps vitis-apps
+make DESIGN=ps vitis-run VITIS_RUN_APP=qspi
+#+end_src
+
+The multiboot pair is the exception. MultiBoot is only observable when the
+BootROM is actually fetching from flash, so with JP4 on JTAG the board waits for
+a debugger instead and a JTAG-loaded build would report a meaningless result.
+That pair ships as its own boot images and is proven by booting the board:
+
+#+begin_src sh
+make DESIGN=ps boot-image           # also builds mb_golden.bin / mb_update.bin
+#+end_src

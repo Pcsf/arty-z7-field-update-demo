@@ -1,0 +1,19 @@
+// mb_golden.bif — MultiBoot redirect demo image, QSPI offset 0x000000
+//
+// The golden half of the MultiBoot redirect demo. NOT the real golden image —
+// that is golden.bif, which carries the blinkctl bitstream and the updater and
+// is golden.bif. This one exists to prove the BootROM redirect and
+// nothing else.
+//
+// No bitstream partition on purpose. Neither demo app touches the PL, so
+// leaving it out keeps both images small and the boot fast. The real images
+// have one.
+//
+// Paths are relative to the project root, which is where make runs bootgen
+// from — see the boot-image target in mk/make/vivado.mk.
+
+the_ROM_image:
+{
+  [bootloader] build/vitis_ws/ps_plat/zynq_fsbl/fsbl.elf
+  build/vitis_ws/multiboot/Debug/multiboot.elf
+}

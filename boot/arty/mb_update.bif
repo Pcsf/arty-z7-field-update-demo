@@ -1,0 +1,19 @@
+// mb_update.bif — MultiBoot redirect demo image, QSPI offset 0x700000
+//
+// The update half of the MultiBoot redirect demo. NOT the real update image —
+// that is update.bif.
+//
+// The SAME FSBL binary as mb_golden.bif, which is not an accident: the design
+// specifies one hooked FSBL in both images, and it is also what makes the demo
+// mean something. The two images differ only in their application partition, so
+// when slot B's banner appears it cannot be a different bootloader taking a
+// different path — the same code ran, and only the address it was fetched from
+// changed.
+//
+// Paths are relative to the project root. See mk/make/vivado.mk § boot images.
+
+the_ROM_image:
+{
+  [bootloader] build/vitis_ws/ps_plat/zynq_fsbl/fsbl.elf
+  build/vitis_ws/multiboot_b/Debug/multiboot_b.elf
+}

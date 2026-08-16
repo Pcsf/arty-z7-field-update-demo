@@ -1,0 +1,59 @@
+#+TITLE: Verified behaviour under fault injection
+#+OPTIONS: toc:nil num:nil
+
+Every row below was executed on hardware and watched. This table is the reason
+to trust the design as a reference: the recovery paths are not arguments, they
+are things that were made to happen.
+
+Three of them found real defects. All three are fixed in this tree. Two of the
+fixes were observed working before being called fixed; the third (F11) is fixed
+but *not yet re-run on hardware*, and says so in its row.
+
+* The matrix
+
+| #  | Fault                     | How it was injected                                  | Observed                                                                                 |
+|----+---------------------------+------------------------------------------------------+------------------------------------------------------------------------------------------|
+| F1 | Server down at boot       | TFTP server stopped, board power-cycled              | Boots normally. The network is never a boot dependency.                                  |
+| F2 | Link lost mid-download    | Ethernet cable pulled during the transfer            | Transfer times out, update aborts, flash untouched. The vulnerable window is *6 s*.       |
+| F3 | Corrupt image on server   | Bytes overwritten mid-file, manifest left alone      | Hash mismatch at step 4. Nothing written.                                                |
+| F4 | Truncated image           | Server file truncated, manifest left alone           | Received length is short of the manifest. Abort before hashing.                          |
+| F5 | Power cut mid-flash-write | Power pulled during erase, and again during program  | ~update_present=0~ ⇒ golden boots. Re-running the update succeeds. Cut twice, both halves. *Scope:* both cuts land while the slot is still incomplete; the rest of the step 5-8 window is F11. |
+| F6 | Corrupt slot at rest      | Valid manifest for an image with a smashed boot header | *Defect found.* The arbiter mistook golden for the update after a BootROM search. Role test corrected, and a boot-header check added at step 4b so a non-image costs a download rather than a slot. |
+| F7 | Update image hangs        | Update built to hang before committing               | Watchdog resets it three times, attempts reach the maximum, board falls back to golden — reachable and serving. *Defect found:* the arbiter could not report *why* it gave up. Fixed. |
+| F8 | Both slots bad            | —                                                    | *Unreachable by design.* The write guard makes golden unwritable in the field. The "golden still boots" half was demonstrated by F6. |
+| F9 | Wrong-version re-send     | A valid older image published as an update           | *Gap found.* The board reinstalled it silently. The manifest now carries a version: an identical image is skipped in ~3 s, an older one is refused, and ~UPDATE FORCE~ is the deliberate override. |
+| F11 | Reset storm during an update | Reset button pressed repeatedly, by hand, as fast as possible | *Defect found, and a regression.* The board reached a complete slot with ~update_present=0~ — the window F5 does not cover. ~SWITCH~ refused for having no update, ~UPDATE~ and ~UPDATE FORCE~ refused for already having it, and no verb could break the tie. The step-2c skip added when F9 was closed is what removed the recovery. 2c now requires the record to agree before it skips, and completes the commit when it does not. *Fix not yet re-run on hardware.* |
+
+* The three defects, and what they were really about
+
+*F6 — one rule written twice.* The arbiter decided its role by asking "am I not
+golden?", which is false after the BootROM searches the device and wraps. The
+fix was to ask "am I the update?" — exactly one slot value means update, and
+everything else means golden, which is the safe direction. The same rule existed
+in a second file and fixing only the first moved the bug rather than removing
+it.
+
+*F7 — the board did the right thing and could not say so.* The fallback
+decision was correct; the console line explaining it was destroyed by the soft
+reset that carried out the decision. The fix waits for the UART transmitter to
+go fully idle — the FIFO *and* the shift register — before resetting.
+
+*F11 — a fix that took a recovery path with it.* Closing F9 added the step-2c
+skip, which returns "already installed" whenever the slot's digest matches the
+manifest. That is exactly the state an interrupted update leaves behind, so the
+skip removed the only route back for a board whose slot is complete and whose
+record is not. Nothing re-ran the earlier fault cases after F9 landed, so the
+loss stayed invisible until the reset storm found it.
+
+The first two are worth reading as a pair: one is a logic defect that a test
+caught, and one is a reporting defect that only fault injection could have
+caught, because everything about the behaviour was already correct. The third is
+the one that argues for re-running a campaign after changing anything in it.
+
+* What is not covered here
+
+- The Zynq configuration-logic watchdog and ICAP-based partial reconfiguration.
+  Neither is reachable on this board with a PS-driven design.
+- Cryptographic authentication of the update. The manifest is integrity-checked,
+  not signed; anything that can reach the TFTP server can serve an image. The
+  manifest format is versioned so a signature can be added as a format bump.

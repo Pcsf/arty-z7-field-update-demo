@@ -1,0 +1,403 @@
+#+TITLE: Control channel — the operator interface over UDP
+#+OPTIONS: toc:2 num:nil
+
+* Control Channel — ICD (Interface Control Document)
+
+*Module:* UDP command channel for the bare-metal field updater on Arty Z7
+(Case B) — the operator interface when there is no serial console
+*Runs in:* both roles of the updater application (see
+[[icd_updater.md][~icd_updater.md~]] § *Roles*)
+*Companions:* [[icd_updater.md][~icd_updater.md~]] — what ~UPDATE~ runs ·
+[[icd_boot_arbiter.md][~icd_boot_arbiter.md~]] — what ~SWITCH~ and ~GOLDEN~ steer
+
+---
+
+** Why this exists
+
+The serial ~u~ trigger was always provisional. The guide offered "console
+command, or auto-poll on boot — your choice", and the console won because it
+keeps a human in the loop while the mechanism is unproven. The mechanism is now
+proven, and the deployment it is proven for has **Ethernet only, no serial
+console**. A board whose only trigger is a keystroke is, in the field, a board
+with no trigger.
+
+Three polling policies were offered — boot-only, boot-plus-periodic, push
+listener — and all three were rejected in favour of capabilities: *get the
+status, command a switch to the installed update, command a new update*. That is
+a command channel, not a polling policy, and the difference is the point. Nothing
+here happens on its own.
+
+*** The Golden Question, asked twice
+
+*Does the system need a control channel at all?* Yes, and the requirement is
+not comfort. With Ethernet-only access, ~run_update()~ never calling ~net_up()~
+means a board that has just installed an update cannot be queried, corrected or
+re-updated. The recovery path for a bad-but-booting update is otherwise a trip to
+the board with a JTAG cable — which is precisely the trip Case B exists to avoid.
+
+*Does it need ~UPDATE~ from the update role?* No, and it does not get it. See
+§ *Role gating*.
+
+---
+
+** Physical Boundary
+
+| Interface | Detail |
+|---+---|
+| Transport | UDP over IPv4, PS GEM0 / RTL8211E, the same interface and the same static address the TFTP client uses |
+| Board address | ~192.168.1.10~, static, compiled in |
+| Control port | *UDP 6100*, fixed, compiled in |
+| Reply address | the source address and source port of the request — never a configured destination |
+| Console | UART0, 115200 8N1 — unchanged, and still the narration channel for the pipeline |
+| Watchdog | SWDT, update role only. The main loop kicks it every iteration; see § *Execution model* |
+
+The port number is arbitrary but fixed, and it is a compile-time constant rather
+than a setting. A configurable port would be an operand, and operands are what
+§ *Verbs only, never operands* forbids.
+
+---
+
+** Wire Format
+
+*Request.* One datagram, one line, plain ASCII:
+
+#+begin_src text
+VERB [CR] [LF]
+#+end_src
+
+- Case-insensitive. ~status~, ~STATUS~ and ~Status~ are the same verb.
+- Leading whitespace is skipped. Trailing ~CR~, ~LF~, ~NUL~ and spaces are ignored.
+- Maximum accepted payload is *64 bytes*. Anything longer is dropped in
+  silence — no reply, no log line, no state change.
+- *Anything else after the verb is an error*, not an argument. See below.
+
+*Response.* One datagram, one line, plain ASCII, terminated ~\n~, under 200
+bytes, sent to the source address and port of the request:
+
+#+begin_src text
+OK <VERB> [key=value ...]
+ERR <VERB|-> <reason>
+#+end_src
+
+One request produces at most one response, except ~UPDATE~, which produces two:
+an immediate ~OK UPDATE started~, then a result line roughly a minute later. Both
+go to the address the request came from.
+
+ASCII over UDP rather than anything structured, because the two properties that
+matter here are *drivable with ~nc~* and *readable in a capture*, and both beat
+being parseable by a program that does not exist yet.
+
+*** Verbs only, never operands
+
+A verb followed by any non-whitespace byte is rejected with
+~ERR <VERB> no arguments accepted~. The parser enforces this; no handler reads an
+address, a port, a filename or a length from the packet, and there is no code
+path by which a packet can influence *where* an image comes from.
+
+This is the same discipline as the flash write guard in
+[[icd_updater.md][~icd_updater.md~]]: the rule is enforced where it cannot be opted
+out of, rather than written down and remembered. It is also the whole security
+argument for opening a control port at all — see § *Security posture*.
+
+---
+
+** Verbs — and the physical consequence of each
+
+The register-map rule applies to verbs: never document what a verb is called
+without documenting what touching it does.
+
+*** `STATUS`
+
+| | |
+|---+---|
+| *Effect* | Reads the boot-state record from QSPI and the ~blinkctl~ VERSION register from the PL. |
+| *Side effects* | One QSPI read transaction. *No write, no erase.* Safe to call at any rate. |
+| *Reply* | ~OK STATUS role=GOLDEN slot=0x00000000 update_present=1 boot_attempts=0 version=0x00010001 state=OK~ |
+| *Roles* | both |
+
+~state=~ is ~bs_result_str()~ — ~OK~ or ~defaulted~ — so a board whose state
+record is erased or corrupt says so rather than reporting a clean zero that looks
+identical to a factory-fresh part. ~version=~ is read from the PL over M_AXI_GP0
+and is therefore also a live proof that the bitstream in the running image
+configured the PL at all.
+
+*** `UPDATE`
+
+| | |
+|---+---|
+| *Effect* | Runs steps 1–8 of [[icd_updater.md][~icd_updater.md~]] § *The Pipeline*. Does *not* redirect — step 9 stays a separate, deliberate act. |
+| *Side effects* | *Erases and programs the update slot.* Clears ~update_present~ before touching it (step 5) and sets it after read-back verification (step 8). Two boot-state sector writes, one 64 KB erase each. Takes ~60 s. |
+| *Reply* | ~OK UPDATE started~ immediately, then ~OK UPDATE installed~ or ~ERR UPDATE <upd_result_str()>~ |
+| *Roles* | golden only |
+
+The two-line answer exists because a single reply sixty seconds after the request
+is indistinguishable, from the operator's side, from a board that ignored it.
+
+~UPDATE~ succeeding does not change what boots. The board keeps running golden
+until somebody sends ~SWITCH~. That separation is inherited from the pipeline
+contract and is not a control-channel decision.
+
+*** `SWITCH`
+
+| | |
+|---+---|
+| *Effect* | The manual retry. Writes ~boot_attempts = 0~, replies, drains the reply, then ~multiboot_to(QSPI_WRITE_FLOOR)~. |
+| *Side effects* | *One boot-state sector write (64 KB erase). Resets the board.* Does not return. ~update_present~ is not modified. |
+| *Reply* | ~OK SWITCH rebooting into update slot~ — sent *before* the reset |
+| *Refused when* | ~update_present == 0~ → ~ERR SWITCH no update installed~ |
+| *Roles* | golden only |
+
+*** `GOLDEN`
+
+| | |
+|---+---|
+| *Effect* | Condemns the installed update. Writes ~boot_attempts = BOOT_ATTEMPTS_MAX~, replies, drains the reply, then ~multiboot_to(0)~. |
+| *Side effects* | *One boot-state sector write (64 KB erase). Resets the board.* Does not return. ~update_present~ is not modified. |
+| *Reply* | ~OK GOLDEN rebooting into golden~ — sent *before* the reset |
+| *Roles* | both. This is the verb that matters most from the update role. |
+| *No-op case* | With ~update_present == 0~ there is nothing to condemn, so *no write happens* and the verb is a plain soft reset. A boot-state write costs a full sector erase; spending one to change a field the arbiter will not read is not free and not silent — the reply is the same either way, and the console line shows which path ran. |
+
+**** Why `GOLDEN` condemns instead of erasing — and why that makes the pair reversible
+
+The arbiter redirects when ~update_present && boot_attempts < BOOT_ATTEMPTS_MAX~.
+So there are exactly two ways to make a board land in golden and *stay* there:
+clear ~update_present~, or push ~boot_attempts~ to the maximum.
+
+Pushing the counter is the one that keeps ~SWITCH~ meaningful. The two verbs
+become exact inverses on one field:
+
+| Verb | writes | arbiter then | reversible by |
+|---+---+---+---|
+| ~SWITCH~ | ~boot_attempts = 0~ | redirects to the update slot | ~GOLDEN~ |
+| ~GOLDEN~ | ~boot_attempts = BOOT_ATTEMPTS_MAX~ | boots golden, reports fallback | ~SWITCH~ |
+
+Clearing ~update_present~ would also stick, but ~SWITCH~ could not undo it — it
+refuses when no update is installed — so an operator who sent ~GOLDEN~ to take a
+look at something would have to re-run the whole 60 s pipeline to get back. The
+installed image is still there and still verified; the record now says it failed,
+which is exactly what the operator asserted by sending the verb.
+
+The counter reaching ~BOOT_ATTEMPTS_MAX~ by operator command and by three failed
+boots are deliberately indistinguishable afterwards. Golden reports ~FALLBACK~
+either way, and there is no second field recording *why*, because a second field
+would be a second source of truth for one fact.
+
+---
+
+** Role gating
+
+| Verb | GOLDEN role | UPDATE role |
+|---+---+---|
+| ~STATUS~ | yes | yes |
+| ~UPDATE~ | yes | ~ERR UPDATE not available in the update role~ |
+| ~UPDATE FORCE~ | yes | ~ERR UPDATE not available in the update role~ |
+| ~SWITCH~ | yes | ~ERR SWITCH already running the update~ |
+| ~GOLDEN~ | yes — a plain soft reset | yes |
+
+*~UPDATE FORCE~ — the one verb with an operand.* The parser refuses operands on
+every verb, deliberately: naming a verb in an error is help, not permission.
+~FORCE~ is the single exception, and it stays
+narrow by construction — the operand is only consulted after ~UPDATE~, only the
+literal ~FORCE~ is accepted, and anything else (including ~FORCE~ after any other
+verb) is still ~ERR ... takes no arguments~.
+
+It admits exactly one install that a bare ~UPDATE~ refuses: a manifest declaring
+a version older than the one recorded as installed. **It relaxes a policy, not a
+check.** Hash, length, boot header and read-back all still apply, and there is no
+argument anywhere in this interface that can switch those off — a field updater
+that can never roll back is its own hazard, but one that can be talked out of
+verifying an image is a different and much worse one. It also does not defeat the
+step-2c skip: re-installing bytes already in the slot is a no-op, not a force.
+
+An operator typing it is saying something about *this* update rather than putting
+the board into a mode, which is why it is an operand and not a fifth verb.
+
+*Why the update role refuses ~UPDATE~.* The capability is already reachable in
+two verbs: ~GOLDEN~, then ~UPDATE~ from golden. Allowing it directly means an
+image erasing and reprogramming the slot it was itself loaded from, and then
+answering an awkward question — the image now in the slot has never been booted,
+but ~boot_attempts~ belongs to the one currently running. Nothing is gained and a
+state machine gets a corner. Refused, and the refusal names the role.
+
+*Why ~SWITCH~ is refused there too.* It would clear ~boot_attempts~ and reboot
+into the slot already running. The reboot is ~GOLDEN~-then-~SWITCH~; the counter
+clear is what a healthy update image does for itself on commit.
+
+---
+
+** Execution model
+
+*The callback records; the main loop acts.* This is the hard constraint of the
+whole module and it comes from a measured failure, not from taste.
+
+#+begin_src text
+udp_recv callback          main loop (both roles)
+  parse the line             pump the stack        <- xemacif_input + etharp_tmr
+  record pending verb        kick the watchdog     <- update role only
+  or reply ERR/busy          poll the console      <- non-blocking
+  free the pbuf              run any pending verb
+#+end_src
+
+The callback may *parse*, *record one pending verb*, and **send at most one
+bounded reply**. It must never touch flash, never call the pipeline, never
+redirect, and never wait for anything.
+
+~UPDATE~ takes about a minute. Running it inside the callback would stop the
+stack draining for that minute, the EMAC ISR would keep allocating pbufs that
+nothing frees, and the pool would exhaust — which is the bug this module was
+written alongside, described below.
+
+*** `ERR busy` is the exception that proves the rule
+
+If a verb is already pending or executing, the callback answers ~ERR <VERB> busy~
+itself. That is a single bounded ~udp_sendto~ with no flash access and no
+waiting, so it does not violate the constraint; and it is what makes a board
+answer *at all* during a 60 s ~UPDATE~, because the pipeline pumps the stack
+while it runs and callbacks therefore keep firing.
+
+A busy board answers rather than going silent. Silence is the one response an
+operator cannot tell from a dead board.
+
+**** The pipeline must pump throughout, and this was wrong on the first bench run
+
+"The pipeline pumps the stack while it runs" was only true for steps 2 and 3,
+because those are inside ~tftp_get()~, which has to pump to receive at all.
+Steps 4 to 8 — a SHA-256 over the whole image, 66 sector erases, a 4.3 MB
+program, and a 4.3 MB read-back — contained no such call, and that is a ~20
+second window in which the board is running but deaf.
+
+It is not deaf in a way that loses packets, which is what makes it dangerous.
+The EMAC keeps receiving and lwIP delivers everything *afterwards*, so a
+command sent into that window is not refused and not dropped — it is *queued*,
+and executed when the pipeline returns.
+
+Measured on the bench, 2026-08-15, with the pipeline running:
+
+| Sent at | Phase | Result |
+|---+---+---|
+| T+6 s | step 3, TFTP download | ~ERR STATUS busy~ — correct |
+| T+12 s | steps 4–8, hash and flash | no reply; executed ~40 s later |
+| T+18 s | steps 4–8 | no reply; executed later |
+
+The consequence was exactly what this section warns about. A ~GOLDEN~ sent
+during a flash write ran one second after ~OK UPDATE installed~ and condemned
+the update that had just been installed and verified.
+
+*Requirement, therefore:* ~updater_run()~ takes a ~poll~ callback and calls it
+inside every loop of steps 4 through 8, at 64 KB granularity. The caller passes
+one function that services the stack and the watchdog, and the same function
+drives the main loop — so there is no window in which the board is doing work
+and not servicing both. A ~poll~ of ~NULL~ re-creates the defect and the header
+says so.
+
+*** The pbuf exhaustion bug this replaces
+
+~run_golden()~ used to block in ~inbyte()~ waiting for a keystroke, servicing
+nothing while it waited. On a live LAN, broadcast traffic arrives, the EMAC ISR
+allocates pbufs, nothing drains them, and the pool exhausts:
+
+#+begin_src text
+unable to alloc pbuf in recv_handler     (29 occurrences in 8 seconds)
+#+end_src
+
+Observed 2026-08-14 on the bench. The field consequence is real: a board left
+sitting in golden becomes progressively less able to accept the update it exists
+to accept. The recovery was a soft reset.
+
+The new main loop pumps ~xemacif_input()~ every iteration and reads the UART only
+when a byte is already waiting, so the wait is no longer a blocking wait. The
+serial menu survives as a local diagnostic calling the same handlers — the same
+functions reached two ways, never two implementations.
+
+*** One pump, one owner
+
+~xemacif_input()~ plus a hand-driven ~etharp_tmr()~ now live in
+~sw/lib/netpump/~, and both the TFTP client and the control channel call it.
+
+That pairing is not incidental. This BSP builds with ~NO_SYS=1~ and
+~NO_SYS_NO_TIMERS=1~, so lwIP's entire timeout subsystem is compiled out and
+nothing calls ~etharp_tmr()~ unless the application does. Without it, exactly one
+ARP request is ever sent per address — ~etharp_query()~ only transmits when it
+creates the entry — and losing that one request leaves the entry ~PENDING~
+forever while ~udp_sendto()~ keeps returning ~ERR_OK~ and transmitting nothing.
+The full write-up is in ~sw/lib/netpump/net_pump.c~, where it moved from
+~tftp_client.c~.
+
+Two copies of that would mean two static tick counters and two consumers of
+~TcpFastTmrFlag~. One module, one owner.
+
+---
+
+** Error & Recovery Contract
+
+| Condition | Detection | Required behaviour |
+|---+---+---|
+| Payload longer than 64 bytes | length check in the callback | *Drop in silence.* No reply. Bounds the amplification factor of the port — see § *Security posture*. |
+| Empty payload, or whitespace only | parser | ~ERR - empty~ |
+| Unknown verb | parser | ~ERR - unknown verb~ — the verb is not echoed back, so the reply cannot be padded by the request |
+| Verb with trailing non-whitespace | parser | ~ERR <VERB> no arguments accepted~ |
+| Verb not available in this role | role gate, in the main loop | ~ERR <VERB> not available in the update role~ / ~already running the update~ |
+| A verb is already pending or running | callback | ~ERR <VERB> busy~. Never queued — a queued command is a command that runs at a time nobody chose. |
+| The interface never came up (~xemac_add~ failed) | at bring-up | The board keeps the serial menu and refuses ~UPDATE~ with ~ERR UPDATE network is down~. Nothing pumps a netif that was never added. ~STATUS~, ~SWITCH~ and ~GOLDEN~ still work from the console — that is the only way to diagnose a board in this state. |
+| ~SWITCH~ with no update installed | boot-state read, in the handler | ~ERR SWITCH no update installed~. No write, no reset. |
+| Boot-state write fails | ~bs_result_t != BS_OK~ | ~ERR <VERB> boot state write failed: <bs_result_str()>~. *No reset.* A reset without the record written would reboot straight back into the state that prompted the command. |
+| ~UPDATE~ fails at any step | ~upd_result_t != UPD_OK~ | ~ERR UPDATE <upd_result_str()>~ — the specific step, never "update failed". Slot state per [[icd_updater.md][~icd_updater.md~]] § *Error & Recovery Contract*. |
+| ~multiboot_to()~ refuses the offset | ~mb_result_t != MB_OK~ | ~ERR <VERB> redirect refused - state written, still here~. The board keeps running and the boot-state write already stands, so the next reset honours the command. Reachable only for an offset that is not slot-aligned, which is a compile-time constant here. |
+| First command after a boot is lost | nothing detects it — it never arrives | *The client retries ~STATUS~ and nothing else.* Measured 2026-08-15: four ~STATUS~ to a freshly booted board produced three replies, and the board's console showed only three, so the missing one was dropped inbound while the link was still settling. This is the same phenomenon ~TFTP_RRQ_MAX_RETRIES~ exists for. Retrying is safe for ~STATUS~ because it is read-only by contract; it is *not* safe for the others, since a lost reply is indistinguishable from a lost request and a retry would re-run a verb the board already ran. Confirm a silent ~UPDATE~, ~SWITCH~ or ~GOLDEN~ with ~STATUS~ rather than repeating it. |
+| Reply cannot be sent (out of pbufs) | ~udp_sendto~ error | Ignored. The verb still executes; the console still narrates. The channel is best-effort and UDP was chosen knowing that. |
+| Link down, cable pulled | nothing detects it | The board keeps running and keeps its state. ~platform.h~ disables the periodic link monitor on this board (it destroys the link it watches), so there is no automatic re-negotiation — the link is brought up once at init. A cable pull needs a reset. Stated as a known limit, not a feature. |
+
+*Unconditional recovery, always:* JP4 to JTAG. It bypasses the boot chain
+entirely, and no state in flash and no packet on the wire can prevent it.
+
+---
+
+** Bad weather — what a hostile or careless client must not be able to do
+
+| Attack | Required outcome |
+|---+---|
+| Verb sent twice in a row, fast | Second gets ~ERR busy~ while the first runs. No double-fire of the pipeline. |
+| ~STATUS~ flooded at line rate | Each answered or ~ERR busy~; no flash writes; nothing accumulates. ~STATUS~ is read-only by contract. |
+| ~UPDATE 192.168.1.9 evil.bin~ | ~ERR UPDATE no arguments accepted~. The fetch target is compiled in and unreachable from the wire. |
+| 64 KB datagram of junk | Dropped in silence. |
+| Datagram with embedded NULs, no terminator | Parsed to the first delimiter; the buffer is NUL-terminated by the receiver, never trusted from the wire. |
+| Command arriving mid-flash-erase | ~ERR busy~ from the callback. The pipeline is never re-entered. |
+| Spoofed source address | The reply goes to the spoofed address. Accepted: the reply is the only thing an attacker gains, and the command set carries no operands, so nothing can be redirected. |
+| Power cut between the reply and the reset | Boot-state record already written; the board comes back and the arbiter honours it. The reply was the truth. |
+
+---
+
+** Security posture
+
+**The control channel is not the weak point, and saying so is part of the
+contract.** The content path is already unauthenticated: anything that can reach
+the link can impersonate the TFTP server and serve an image that hashes correctly
+against its own manifest. SHA-256 here is integrity, not authenticity.
+
+Against that, a verb-only channel that cannot be told where to fetch from adds
+very little. What it does add is bounded and stated:
+
+- an unauthenticated party on the link can trigger a fetch from the *compiled-in*
+  server, condemn an update, or switch to one — all of which are recoverable and
+  none of which can install content the attacker chose;
+- the port answers ≤200 byte replies to ≤64 byte requests, so its amplification
+  factor is under 4× and oversized junk gets nothing at all.
+
+The real fix is signed images. Do not let the existence
+of this ICD's threat table read as a claim that the problem is handled.
+
+---
+
+** What this ICD does not cover
+
+Auto-poll. Nothing here happens on its own — every action is a verb from an
+operator. A boot-time poll is a small change on top of this plumbing and is
+a possible extension; it is left out because manual control is what was asked
+for.
+
+Multiple concurrent operators. One pending verb, one requester address. A second
+operator gets ~ERR busy~ and can retry, which is the correct behaviour for a
+board with one flash and one boot state.
+
+Discovery. The board's address is static and compiled in. There is no broadcast
+announcement and no responder on a well-known port.

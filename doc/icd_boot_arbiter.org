@@ -1,0 +1,245 @@
+#+TITLE: Boot arbiter — FSBL hook and boot state record
+#+OPTIONS: toc:2 num:nil
+
+* Boot Arbiter — ICD (Interface Control Document)
+
+*Module:* Hooked FSBL — boot-time arbitration between golden and update images on Arty Z7 (Case B)
+*Context:* Same FSBL binary is placed in both golden (QSPI 0x0) and update (QSPI 0x700000) BOOT.BIN images.
+
+** Boot State Record (QSPI 0xFF0000)
+
+#+begin_src c
+typedef struct {
+    uint32_t magic;             /* 0xB007CAF2                              */
+    uint32_t update_present;    /* 1 = update slot verified good           */
+    uint32_t boot_attempts;     /* incremented on update boot, 0 on commit */
+    uint32_t installed_version; /* the manifest's CLAIM, stamped at commit */
+    uint32_t crc32;             /* CRC32 over every field above            */
+} boot_state_t;
+
+#define BOOT_ATTEMPTS_MAX  3
+#+end_src
+
+- Bad magic or bad CRC ⇒ treat as ~{update_present=0, boot_attempts=0}~ and rewrite (factory-fresh = golden by construction).
+- ~installed_version~ was added so the updater can
+  answer *is this worth installing* without booting anything. **The arbiter does
+  not read it and must not** — the arbiter picks a slot; which release is in it
+  is the updater's business.
+- It is a *declaration, not a measurement*. The payload's real ~VERSION~ is an
+  AXI register that cannot be read until the image is flashed and booted, so
+  nothing can check the manifest's claim at install time. Meaningless when
+  ~update_present~ is 0.
+- *The magic was bumped from ~0xB007CAFE~ to ~0xB007CAF2~* with that field. A
+  record in the older shape has a different layout, and letting it merely fail the
+  CRC would have been correct but indistinguishable from corruption. The reader
+  reports the two separately — ~previous record format~ versus ~absent or corrupt~ —
+  and both still default to ~{update_present=0, boot_attempts=0}~, so a firmware
+  upgrade degrades exactly like factory-fresh flash: boots golden, and one
+  ~UPDATE~ restores the record in the current format.
+
+** Arbiter Logic (FsblHookBeforeBitstreamDload)
+
+*Read the slot index, never the raw register.* ~DEVCFG_MULTIBOOT~ is only
+13 bits wide — bits [12:0] — and the bits above the field are *not* zero on a
+golden boot. Measured on hardware 2026-08-14 (the `multiboot` example): after a
+power-on reset and a normal boot from offset 0, the register reads
+~0x0000C000~. The slot index is correctly ~0~; bits 14 and 15 are set by the
+BootROM and are undocumented in the generated platform.
+
+This ICD previously specified
+
+#+begin_src text
+    where = Xil_In32(DEVCFG_MULTIBOOT) ? UPDATE : GOLDEN     /* WRONG */
+#+end_src
+
+which is *true on a golden boot*, so the arbiter would have believed it was
+running the update image from its very first boot — incrementing
+~boot_attempts~ against the wrong slot and reaching ~BOOT_ATTEMPTS_MAX~ on a
+board with no update installed. The vendor FSBL never reads it raw either: it
+masks with ~PCAP_MBOOT_REG_REBOOT_OFFSET_MASK~ (~0x1FFF~) at all three of its
+use sites — ~image_mover.c:200~, ~main.c:1439~, ~main.c:1477~.
+
+#+begin_src text
+FsblHookBeforeBitstreamDload():
+    st = read_boot_state()
+    where = multiboot_slot_index() ? UPDATE : GOLDEN
+    /* multiboot_slot_index() == Xil_In32(DEVCFG_MULTIBOOT) & 0x1FFF
+     * examples/multiboot/multiboot.[ch] — proven on hardware */
+
+    if (where == GOLDEN) {
+        if (st.update_present && st.boot_attempts < BOOT_ATTEMPTS_MAX) {
+            multiboot_to(0x700000)        /* redirect to update, soft reset */
+        }
+        /* else: fall through, boot golden (updater app runs) */
+    } else { /* UPDATE */
+        if (st.boot_attempts >= BOOT_ATTEMPTS_MAX) {
+            multiboot_to(0)               /* back to golden, never returns */
+        }
+        st.boot_attempts++
+        write_boot_state(st)
+        /* NO watchdog call here — the FSBL stops it before handoff.
+         * The update application arms it. See § The Watchdog Is Armed By
+         * The Application. */
+    }
+#+end_src
+
+** The Hook Site — verified against the 2021.2 FSBL in this workspace
+
+~FsblHookBeforeBitstreamDload()~ is the right hook, but not for the reason the
+guide gave, and it carries two constraints that must shape the implementation.
+Call site: ~build/vitis_ws/ps_plat/zynq_fsbl/image_mover.c:431~.
+
+#+begin_src c
+    if (PLPartitionFlag) {
+        Status = FsblHookBeforeBitstreamDload();
+        if (Status != XST_SUCCESS) {
+            OutputStatus(FSBL_BEFORE_BSTREAM_HOOK_FAIL);
+            FsblFallback();
+        }
+    }
+#+end_src
+
+*1. It is conditional on the image containing a PL partition.* The hook sits
+*inside* the partition loop, guarded by ~PLPartitionFlag~ — it runs when a
+bitstream partition is about to be moved, not once at boot. Both golden and update
+images carry a bitstream (blinkctl v1 / v2), so the arbiter runs in both. But that
+is a property of the BIF, not of the boot flow: **an image built without a
+bitstream would never arbitrate at all.** Any future recovery image must keep a PL
+partition, or move the arbiter to ~FsblHookBeforeHandoff()~ (~main.c:753~), which
+is unconditional but runs after the PL is already configured.
+
+*2. The hook must never return an error.* A non-~XST_SUCCESS~ return calls
+~FsblFallback()~, and ~FsblFallback()~ calls ~Update_MultiBootRegister()~, which
+*increments* ~MULTIBOOT_ADDR~ to hunt for the next image. That mutates the exact
+register the arbiter derives its slot from, from inside the arbiter's own error
+path. The contract is therefore:
+
+#+begin_quote
+The arbiter either redirects (via `multiboot_to()`, which does not return) or
+#+end_quote
+#+begin_quote
+returns `XST_SUCCESS`. It never returns an error code. A failure it cannot
+#+end_quote
+#+begin_quote
+handle — unreadable state sector, QSPI error — is treated as
+#+end_quote
+#+begin_quote
+`{update_present=0, boot_attempts=0}` and booted as golden, which is the safe
+#+end_quote
+#+begin_quote
+terminal state anyway.
+#+end_quote
+
+Cost of this hook site: a redirect discards any PS partition already moved to DDR
+earlier in the loop. That is wasted work, not a hazard — the soft reset discards
+DDR state regardless.
+
+** The Watchdog Is Armed By The Application, Not The Arbiter
+
+This ICD's pseudocode calls
+~arm_swdt_system_reset(timeout_s = 15)~ from inside the hook. **That cannot
+work.** The stock FSBL stops the watchdog unconditionally on its way to the
+application:
+
+#+begin_src c
+/* main.c:759 — after FsblHookBeforeHandoff(), before handoff */
+#ifdef XPAR_XWDTPS_0_BASEADDR
+    XWdtPs_Stop(&Watchdog);
+#endif
+#+end_src
+
+Anything the arbiter arms is switched off a few hundred instructions later, so a
+hung update application would never be reset, ~boot_attempts~ would never climb,
+and the fallback path would silently not exist. Neither hook site escapes this —
+~FsblHookBeforeHandoff()~ at ~main.c:753~ runs immediately *before* the stop.
+
+Note this only became true when the watchdog was enabled in hardware: every FSBL
+watchdog site is ~#ifdef XPAR_XWDTPS_0_BASEADDR~, so before that the vendor FSBL
+compiled with watchdog support silently absent.
+
+*Corrected division of labour:*
+
+| Actor | Responsibility |
+|---+---|
+| Arbiter (FSBL hook) | Decide the slot, increment ~boot_attempts~, write it. *Does not touch the watchdog.* |
+| Update application | Arm the watchdog as its *first* action in ~main()~, service it, and clear ~boot_attempts~ on commit. |
+| Golden application | Does not arm it. Golden is the safe state; a watchdog there would reset a board that is behaving correctly. |
+
+This also matches what the guide says elsewhere — "the update *application* services
+the watchdog in its main loop". If the application services it, the application
+arms it.
+
+*The residual gap, stated rather than hidden:* between the FSBL's ~XWdtPs_Stop()~
+and the application's arm call, nothing is watching. An update image that crashes
+in early startup — before reaching its arm call — hangs without a reset. The
+mitigation is to arm first, before console, before any peripheral init, so the
+window is a few hundred instructions of known-good startup code. It cannot be
+closed entirely from the application side, and a board that will not survive its
+own C runtime startup is not a case the attempt counter was ever going to catch.
+
+Reference settings from the FSBL's own configuration (~main.c:1155~): prescaler
+~XWDTPS_CCR_PSCALE_4096~, reset output enabled via
+~XWdtPs_EnableOutput(&Watchdog, XWDTPS_RESET_SIGNAL)~. Instance
+~XPAR_XWDTPS_0_BASEADDR~ = ~0xF8005000~, clock 108,333,336 Hz.
+
+~fsbl.h:426~ defines ~RESET_REASON_SWDT~, so the arbiter can distinguish a
+watchdog-induced boot from a normal one and log it — useful evidence when an update hangs,
+though the attempt counter is what actually drives the decision.
+
+** Update Application Commit
+
+After self-check (PL heartbeat moving + N seconds stable), the update app writes:
+#+begin_src text
+boot_attempts = 0    /* commit — healthy update is now the steady state */
+#+end_src
+A deliberate hang before this triggers the watchdog, increments attempts, and at MAX routes back to golden.
+
+** Safety Guarantees
+
+- Golden image is physically unwritable by the updater (flash-write function asserts ~addr >= 0x700000 && addr < 0xFF0000~).
+- ~update_present~ is only set *after* read-back verify succeeds, so mid-flash power cut never activates a corrupted slot.
+- BootROM validates boot header before executing — second line of defense.
+- attempts is written once per boot to a dedicated 64 KB sector (~100 k endurance, decades at any sane rate).
+- A POR clears ~DEVCFG_MULTIBOOT~, so a power cycle always re-enters golden regardless of what the previous boot armed — golden is the default by construction, not by policy. Demonstrated on hardware with the ~PORB~ button (lands in golden) versus ~SRST~ (soft reset, preserves the register, lands in update).
+
+** Known limit: the state write is not atomic
+
+Observed on hardware 2026-08-14, during the first durability run.
+
+A committed update survived one power-on reset correctly — the arbiter read
+~update_present=1~, redirected, and the board came back at 4 Hz. A **second POR
+pressed roughly a second later wiped the record**: the next boot read
+~absent or corrupt~, defaulted to ~{update_present=0, boot_attempts=0}~, and
+booted golden at 1 Hz.
+
+Nothing was wrong. ~boot_state_write()~ is erase-then-program on a single
+sector, because programming only clears bits and this record's fields move in
+both directions. A reset between the erase and the program leaves the sector
+erased, which is exactly the state this design treats as "no update installed".
+It failed *safe*: golden booted, the board stayed reachable over TFTP, and
+re-running the updater restored it on the first attempt.
+
+*Each update boot performs two state writes* and both carry the window:
+
+| When | Writer | What |
+|---+---+---|
+| immediately after redirect | arbiter | ~boot_attempts++~ |
+| after the health check | update app | ~boot_attempts = 0~ (commit) |
+
+So the exposure per update boot is two short erase-program pairs, and the cost
+of losing one is a committed update reverting to golden — never a board that
+cannot boot.
+
+*Mitigation, not implemented here and deliberately so:* two alternating state
+sectors with a sequence number, where the reader takes the newest valid record
+and a torn write leaves the previous one intact. That is the ping-pong scheme
+the endurance note in ~icd_updater.md~ already mentions as the production
+answer. This design keeps one sector, accepts the window, and now has hardware
+evidence for what the window actually costs rather than an argument about it.
+
+*For anyone running the demo:* wait for ~UPD: running. Servicing watchdog.~
+before power-cycling again. That line means both writes are done.
+
+** Provenance
+
+The ~multiboot_to()~ / ~multiboot_slot_index()~ primitives this arbiter is built on are implemented and hardware-proven in ~examples/multiboot/~, including the SLCR unlock that gates the reset write, alignment and 13-bit range refusals, and the redirect itself. See *MultiBoot redirect (the `multiboot` example)* in the README.

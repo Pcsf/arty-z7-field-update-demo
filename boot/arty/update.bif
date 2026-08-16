@@ -1,0 +1,41 @@
+// update.bif — Arty Z7 UPDATE BOOT.BIN (Case B), QSPI offset 0x700000
+//
+// The only region the updater may write. This image is what gets served over
+// TFTP as update.bin and programmed into the slot; it is never flashed directly
+// in the field, only by the updater that verified it twice.
+//
+// Identical structure to golden.bif, and two of the three partitions are the
+// SAME FILES:
+//
+//   fsbl.elf      the same hooked FSBL, byte for byte. Not an oversight and not
+//                 laziness -- it is the design. One arbiter binary means the
+//                 golden and update boots cannot disagree about the rules, and
+//                 it removes the whole class of bug where a fix lands in one
+//                 image and not the other. It decides its role at runtime from
+//                 multiboot_slot_index().
+//
+//   blinkctl_v2   VERSION 0x0002_0001, 4 Hz. THE ONLY DELIBERATE DIFFERENCE
+//                 from golden, and the one you can see from across the room.
+//                 Same RTL, two generic values.
+//
+//   updater.elf   the same updater binary. Here it comes up in its UPDATE role:
+//                 arm the watchdog, prove the payload's heartbeat is moving,
+//                 then clear boot_attempts -- the commit. Failing to reach that
+//                 commit is what eventually returns the board to golden.
+//
+// For fault-campaign item F7, build a deliberately broken v2 by compiling the
+// updater with -DUPDATER_FAULT_HANG=1 and rebuilding this image. It will come
+// up, prove healthy, and then hang before committing; the watchdog resets it,
+// the arbiter counts 1 -> 2 -> 3, and at BOOT_ATTEMPTS_MAX the board falls back
+// to golden reporting the failure. That path is the entire safety argument of
+// Case B and it is not proven until it has been watched.
+//
+// NOT compressed, same reasoning as golden.bif -- 4.08 MB into an 8.94 MB slot,
+// 45.7% used.
+
+the_ROM_image:
+{
+  [bootloader] build/vitis_ws/ps_plat/zynq_fsbl/fsbl.elf
+  build/boot/blinkctl_v2.bit
+  build/vitis_ws/updater/Debug/updater.elf
+}
