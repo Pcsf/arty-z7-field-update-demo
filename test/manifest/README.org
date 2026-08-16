@@ -1,0 +1,36 @@
+#+TITLE: Host tests for the manifest parser
+#+OPTIONS: toc:nil num:nil
+
+~manifest_parse()~ is the first thing on the board to touch bytes that came off
+the network, and every one of its failure modes is reachable from the wire.
+Running it on a board costs a workspace rebuild, a TFTP install and a jumper
+move. Running it here costs a second.
+
+Twenty cases, including the three that carry the safety argument:
+
+- the *old two-line format* is refused, and refused /by name/ rather than as a
+  generic parse error, because host and board move together and a stale release
+  script is the likeliest cause;
+- a *future format version* is refused rather than half-read;
+- an *unknown key* is refused rather than ignored — the property that stops a
+  signed manifest (format 2) being consumed by a format-1 board with the
+  signature silently skipped.
+
+* Running
+
+#+begin_src sh
+make manifest-test        # from the repo root, on the host, no container needed
+#+end_src
+
+* How it works, and its one limitation
+
+~test_manifest.c~ includes ~updater.c~ directly, because ~manifest_parse()~ is
+~static~ and should stay that way: it is not part of the module's contract, and
+widening its linkage to make it testable would be the test wagging the design.
+
+~stub/~ holds one-line replacements for the headers ~updater.c~ pulls in. They
+exist to make the file compile on a host, nothing more.
+
+*So this tests the parser, not the pipeline.* Anything touching flash, the
+network or the boot state is stubbed to a no-op here and is proven on the board
+instead. Do not add a case to this file that pretends otherwise.

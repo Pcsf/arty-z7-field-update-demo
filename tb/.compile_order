@@ -1,0 +1,6 @@
+# Testbench compile order
+# axil_bfm and tb_tripwires must precede tb_blinkctl (which uses/instantiates them)
+axil_bfm.vhd
+tb_tripwires.vhd
+tb_blinkctl.vhd
+tb_blinkctl_axil.vhd

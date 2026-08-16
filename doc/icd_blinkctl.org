@@ -1,0 +1,39 @@
+#+TITLE: blinkctl — AXI4-Lite payload peripheral
+#+OPTIONS: toc:2 num:nil
+
+* blinkctl — ICD (Interface Control Document)
+
+*Peripheral:* blinkctl — AXI4-Lite slave driving board LEDs with programmable blink divider
+*Base Address:* ~0x43C0_0000~ (Arty Z7, M_AXI_GP0)
+*Clock:* 125 MHz (Arty Z7, FCLK_CLK0)
+
+** Bus Protocol
+
+Full AXI4-Lite, 32-bit data, single beat, non-pipelined: one outstanding
+write and one outstanding read. AW and W are accepted independently (any
+order, or the same cycle); the write commits when both halves have been
+captured. WSTRB is ignored — all writes are treated as full-word (masters
+must not issue partial writes). AWPROT/ARPROT are accepted and ignored.
+All responses are OKAY; SLVERR is never issued.
+
+** Register Map
+
+| Offset | Name    | Access | Reset      | Description and side effects                                                                                              |
+|--------+---------+--------+------------+---------------------------------------------------------------------------------------------------------------------------|
+| 0x00   | VERSION | RO     | G_VERSION  | ~[31:16]~ major, ~[15:0]~ minor. *Side effect:* none. Writes accepted (OKAY) and discarded — never lock bus on RO write. |
+| 0x04   | CTRL    | R/W    | 0x0000_0001| Bit 0 ~BLINK_EN~. *Side effect:* clearing freezes LED at its current state (does not force off).                         |
+| 0x08   | BLINK_DIV | R/W  | G_BLINK_DIV_RST | Half-period in clk cycles. *Side effect:* new value loaded only at next divider zero-crossing (never mid-count). Writing 0 clamped to 1; STATUS.DIVCLAMP sets. |
+| 0x0C   | HEARTBEAT | RO   | 0          | Free-running counter, increments every clk. *Side effect:* none. Two reads returning different values prove PL is alive.  |
+| 0x10   | SCRATCH | R/W    | 0xDEAD_BEEF| Pure R/W test register. *Side effect:* none. Post-reconfiguration value proves PL was reprogrammed.                      |
+| 0x14   | STATUS  | RO     | 0          | Bit 0 ~DIVCLAMP~, sticky, cleared by writing 1 (W1C via this same offset).                                                |
+
+** Contract Clauses (tripwire monitors)
+
+1. Reads/writes to any address always complete. Unmapped addresses (offsets ≥ 0x18 within the 64-byte decode window): writes return OKAY and are discarded; reads return OKAY with data 0. SLVERR is never issued.
+2. BLINK_DIV never updates mid-count.
+3. LED toggles exactly every BLINK_DIV cycles when enabled.
+
+** Versioning
+
+- *v1:* ~VERSION = 0x0001_0001~, default blink 1 Hz (div = 125_000_000 @ 125 MHz)
+- *v2:* ~VERSION = 0x0002_0001~, default blink 4 Hz (div = 31_250_000 @ 125 MHz)

@@ -1,0 +1,95 @@
+#+TITLE: Host-side tooling and its dependencies
+#+OPTIONS: toc:nil num:nil
+
+The board fetches its update over TFTP, so the host has to serve one. These
+scripts stand that up, publish releases into it, and drive the board's control
+channel.
+
+* Dependencies
+
+** Required
+
+| Need        | Arch package | Why                                                                   |
+|-------------+--------------+-----------------------------------------------------------------------|
+| ~in.tftpd~  | ~tftp-hpa~   | the TFTP server itself, plus its ~tftpd.socket~/~tftpd.service~ units |
+| ~bash~ 4+   | ~bash~       | ~ctrl.sh~ talks UDP through ~/dev/udp~, a bash feature                |
+| ~systemctl~ | ~systemd~    | starting, enabling and tearing down the daemon                        |
+| coreutils   | ~coreutils~  | ~stat~, ~install~, ~mktemp~, ~sha256sum~, ~dd~, ~stdbuf~              |
+| ~awk~       | ~gawk~       | timestamping the console capture                                      |
+| ~make~      | ~make~       | ~release.sh~ asks it for the payload version                          |
+
+~setup_tftp.sh~ installs ~tftp-hpa~ for you if it is missing:
+
+#+begin_src sh
+sudo pacman -S --needed tftp-hpa
+#+end_src
+
+** Optional
+
+| Need      | Arch package | Why                                                          |
+|-----------+--------------+--------------------------------------------------------------|
+| ~ufw~     | ~ufw~        | if enabled, two rules are needed — the script prints both      |
+| ~tcpdump~ | ~tcpdump~    | proving the board's read request actually reaches this host  |
+
+* These scripts are Arch-specific
+
+~setup_tftp.sh~ calls ~pacman~ and manages ~tftpd.socket~/~tftpd.service~ by
+those names. Nothing else in the repository cares what distribution you run —
+only this directory does.
+
+On another distribution, install the equivalent server and point it at
+~/srv/tftp~ yourself. The unit and package names differ:
+
+| Distribution   | Package       | Units                           |
+|----------------+---------------+---------------------------------|
+| Arch           | ~tftp-hpa~    | ~tftpd.socket~, ~tftpd.service~ |
+| Debian, Ubuntu | ~tftpd-hpa~   | ~tftpd-hpa.service~             |
+| Fedora, RHEL   | ~tftp-server~ | ~tftp.socket~, ~tftp.service~   |
+
+Everything the board needs from the server is ordinary read-only TFTP on
+UDP/69, serving ~/srv/tftp~. There is nothing special about ~hpa~'s
+implementation — it is simply the one these scripts automate.
+
+* The scripts
+
+| Script               | What it does                                                                                 |
+|----------------------+----------------------------------------------------------------------------------------------|
+| ~setup_tftp.sh~      | installs and starts the server, creates ~/srv/tftp~, writes probe files, checks the firewall |
+| ~teardown_tftp.sh~   | stops and disables it; ~--purge~ also removes the served files                               |
+| ~release.sh~         | publishes ~update.bin~ and its manifest into ~/srv/tftp~                                     |
+| ~ctrl.sh~            | sends one control verb to the board and prints the reply                                     |
+| ~capture-console.sh~ | logs the serial console, surviving the board re-enumerating its USB bridge                   |
+
+* Two things worth knowing before you debug a timeout
+
+*~ctrl.sh~ deliberately has no external dependencies.* An earlier version used
+~nc~, which is not installed everywhere and failed with the board already booted
+and waiting. Bash's own ~/dev/udp~ is always there. It also reads replies with
+~dd~ rather than ~read~: ~read~ takes one byte at a time, and on a *datagram*
+socket a short read consumes the whole datagram and discards the remainder — so
+~read~ returns the first character of the reply and then blocks forever waiting
+for a newline that was already thrown away.
+
+*One reader per serial port.* Two processes reading the same tty each get a
+random share of the bytes, and both logs come out plausibly formatted and
+quietly incomplete. Before believing anything a console tells you:
+
+#+begin_src sh
+fuser -v /dev/serial/by-id/usb-Digilent_*-if01-port0   # must show exactly one
+#+end_src
+
+~capture-console.sh~ reopens in a loop by design, which means it outlives the
+shell that started it. Killing the visible ~cat~ is not enough — the loop
+respawns it. Kill the loop first.
+
+* Configuration
+
+| What                     | Where                                                     |
+|--------------------------+-----------------------------------------------------------|
+| TFTP root                | ~TFTP_ROOT~ in ~setup_tftp.sh~ and ~release.sh~           |
+| Board IP                 | ~BOARD_IP~ environment variable, else ~ctrl.sh~'s default |
+| Board's own IP           | ~BOARD_IP_*~ in ~sw/arty_updater/main.c~                  |
+| Server IP the board uses | ~TFTP_SRV_*~ in ~sw/arty_updater/main.c~                  |
+
+The board's addresses are compiled in, so changing them means rebuilding the
+updater. The defaults are a private ~192.168.1.0/24~ bench.

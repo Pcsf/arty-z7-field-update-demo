@@ -1,0 +1,253 @@
+#+TITLE: Arty Z7 Field-Update Demo
+#+OPTIONS: toc:2 num:nil
+
+A working *field-update mechanism* for the Digilent Arty Z7-20 (Zynq-7000): the
+board fetches a new boot image over TFTP, verifies it, writes it to a second
+QSPI slot, verifies what landed, reboots into it, and proves it healthy before
+committing. If anything goes wrong at any step — bad hash, truncated download,
+power cut mid-write, an image that boots and hangs — the board returns to a
+golden image that is never written in the field.
+
+This is a *reference design*. It exists to be read and lifted from, so the
+reasoning behind every non-obvious decision lives in the code comments next to
+the code it explains.
+
+* What it demonstrates
+
+- A *golden + update* flash layout where the golden image is unreachable from
+  the field by construction, not by policy.
+- A *boot arbiter* overlaid onto the Zynq FSBL that chooses a slot from the
+  MultiBoot register and counts failed attempts.
+- A *nine-step update pipeline* that never gives up a working slot until the
+  replacement has been verified twice.
+- An *operator interface over UDP*, because the target deployment has Ethernet
+  and no serial console.
+- *Recovery that has been watched happening*, not merely reasoned about — see
+  [[file:doc/verified_behaviour.org][verified behaviour]].
+
+* Hardware and tools
+
+| Item      | What                                                              |
+|-----------+-------------------------------------------------------------------|
+| Board     | Digilent Arty Z7-20 (XC7Z020), JP4 selects QSPI or JTAG boot      |
+| Flash     | 16 MB QSPI                                                        |
+| Link      | Ethernet, board and host on the same subnet                       |
+| Toolchain | Xilinx Vivado + Vitis 2021.2                                      |
+| Host      | a TFTP server serving ~/srv/tftp~, and GNU make — see [[file:host/README.org][host/README.org]] for exact packages |
+
+All Vivado and Vitis targets must run where those tools are on ~PATH~. The
+makefiles warn if they are not.
+
+* Quick start
+
+#+begin_src sh
+git clone --recurse-submodules <this-repo>
+cd arty-z7-field-update-demo
+
+./host/setup_tftp.sh                 # once, on the host
+
+make DESIGN=ps payload-bitstreams    # both payload versions, v1 and v2
+make DESIGN=ps xsa                   # hardware platform
+make DESIGN=ps vitis-platform        # BSP + FSBL, with the arbiter overlaid
+make DESIGN=ps vitis-apps            # the updater application
+make DESIGN=ps boot-image            # golden.bin and update.bin
+
+# JP4 to JTAG, then:
+make DESIGN=ps flash-boot            # writes GOLDEN only, at offset 0
+
+# JP4 back to QSPI, power-cycle, then from the host:
+./host/release.sh arty               # publish update.bin + its manifest
+./host/ctrl.sh STATUS
+./host/ctrl.sh UPDATE                # fetch, verify, flash, verify
+#                                    # add FORCE to accept an older version
+./host/ctrl.sh SWITCH                # boot what was just installed
+#+end_src
+
+LED blink rate is the visible result: 1 Hz before the update, 4 Hz after.
+
+The first ~make~ in a fresh clone scans the source tree and generates the
+per-directory makefile fragments it needs. They are build artefacts, not
+sources, so they are not committed — if you add a new source directory, run
+~make scan~ to pick it up.
+
+* Targets and what they depend on
+
+Read this table before running anything. Each target consumes the output of the
+ones above it.
+
+| Target               | Consumes                                                 | Produces                                   |
+|----------------------+----------------------------------------------------------+--------------------------------------------|
+| ~payload-bitstreams~ | ~rtl/~, ~vivado/arty/~ constraints                       | ~build/boot/blinkctl_v1.bit~ and ~_v2.bit~ |
+| ~xsa~                | the PS block design                                      | hardware platform handoff                  |
+| ~vitis-platform~     | the ~.xsa~, ~sw/arty_fsbl_hooks/~, ~sw/lib/~             | BSP and the *hooked FSBL* ~fsbl.elf~       |
+| ~vitis-apps~         | ~sw/arty_updater/~, ~sw/lib/~                            | ~updater.elf~                              |
+| ~boot-image~         | ~boot/arty/*.bif~ + the ELFs and both payload bitstreams | ~golden.bin~, ~update.bin~                 |
+| ~flash-boot~         | ~golden.bin~                                             | golden written to QSPI offset 0            |
+| ~sim~                | ~rtl/~, ~tb/~                                            | testbench transcript, TC-01..TC-10         |
+| ~manifest-test~      | ~test/manifest/~                                         | host-side parser tests, no board needed    |
+
+Two things worth stating plainly, because they are the questions people ask:
+
+1. *The demo does not build anything from ~examples/~.* Those are independent
+   applications. You can delete the whole directory and every target above still
+   works.
+2. *The two payload bitstreams are the same design built twice.* ~v1~ blinks at
+   1 Hz and reports ~VERSION 0x00010001~; ~v2~ blinks at 4 Hz and reports
+   ~0x00020001~. They differ only by generics — see ~project.mk~ § Payload
+   version — and ~payload-bitstreams~ builds both and stages them under the
+   names the ~.bif~ files expect. Running plain ~bitstream~ leaves ~boot-image~
+   unable to find them.
+3. *~vitis-platform~ is where the boot arbiter enters the build.* It overlays
+   ~sw/arty_fsbl_hooks/~ onto the generated FSBL, so the same hooked FSBL ends
+   up inside both boot images. Changing anything in ~sw/lib/~ or
+   ~sw/arty_fsbl_hooks/~ means regenerating the platform.
+
+* Repository layout
+
+| Path                  | What it is                                                                                 | Needed to build the demo? |
+|-----------------------+--------------------------------------------------------------------------------------------+---------------------------|
+| ~rtl/~                | ~blinkctl~, the payload peripheral being updated                                           | yes                       |
+| ~tb/~                 | self-checking testbench for ~blinkctl~                                                     | no, but run it            |
+| ~sw/lib/~             | the reusable modules: qspi, sha256, tftp, multiboot, boot state, control channel, net pump | yes                       |
+| ~sw/arty_fsbl_hooks/~ | the boot arbiter, overlaid onto the FSBL                                                   | yes                       |
+| ~sw/arty_updater/~    | the field updater application                                                              | yes                       |
+| ~boot/arty/~          | ~.bif~ files describing each boot image                                                    | yes                       |
+| ~host/~               | host-side scripts: TFTP setup, release, operator control                                   | yes, to run it            |
+| ~test/manifest/~      | host-side tests for the manifest parser                                                    | no                        |
+| ~examples/~           | standalone apps, one per mechanism                                                         | *no*                      |
+| ~vivado/~             | board constraints                                                                          | yes                       |
+| ~mk/~                 | the shared makefile framework (git submodule)                                              | yes                       |
+
+* examples/ — one mechanism at a time
+
+Each application under ~examples/~ proves *one* mechanism on real hardware, in
+isolation, with nothing else in the way. They were how each piece of this design
+was established before the updater composed them, and they are the fastest way
+to get a single mechanism working in your own project.
+
+They consume ~sw/lib/~ the same way the demo does. *Nothing in the demo consumes
+them.*
+
+| Example       | Proves                                                               |
+|---------------+----------------------------------------------------------------------|
+| ~regs~        | the PS reaching a PL peripheral over ~M_AXI_GP0~                     |
+| ~lwip_echo~   | Ethernet up under lwIP with ~NO_SYS=1~                               |
+| ~tftp_client~ | fetching a file into DDR over TFTP                                   |
+| ~qspi~        | erase / program / read-back against the real part, with a guard      |
+| ~sha256~      | hashing a large buffer in chunks                                     |
+| ~multiboot~   | the MultiBoot redirect: arm the register, soft-reset, land elsewhere |
+| ~multiboot_b~ | the other half of that pair — the image you land *on*                |
+
+Build one with ~make DESIGN=ps vitis-apps~ and run it with
+~make DESIGN=ps vitis-run VITIS_RUN_APP=<name>~. The multiboot pair is the
+exception: it can only be observed from flash, so it ships as its own boot-image
+pair rather than a JTAG download.
+
+* The operator interface
+
+Four verbs over UDP port 6100, plain ASCII, so ~host/ctrl.sh~ is a convenience
+rather than a dependency — anything that can send a datagram works.
+
+| Verb | What it does | Accepted in role |
+|------+--------------+------------------|
+| ~STATUS~ | role, slot, ~update_present~, ~boot_attempts~, running and installed version | both |
+| ~UPDATE~ | fetch, verify, flash, verify, commit. Does NOT change what boots | golden |
+| ~UPDATE FORCE~ | the same pipeline, admitting an older version — see below | golden |
+| ~SWITCH~ | clear ~boot_attempts~ and reboot into the update slot | golden |
+| ~GOLDEN~ | condemn the installed update and reboot into golden | both |
+
+#+begin_src sh
+./host/ctrl.sh UPDATE FORCE            # operand, not a flag; before the board IP
+#+end_src
+
+** What FORCE does, and what it does not
+
+A bare ~UPDATE~ refuses a manifest whose version is strictly older than the one
+recorded as installed, and only when an update is actually recorded. ~FORCE~
+relaxes *that policy and nothing else*:
+
+- Hash, length, boot header and post-write read-back all still apply. There is
+  no argument anywhere in this interface that switches an integrity check off.
+- An image whose digest already matches the slot is still skipped as a no-op.
+  Re-installing identical bytes is not what forcing means, and it would spend a
+  flash-wear cycle to achieve nothing.
+- ~GOLDEN~ remains reachable in both roles, so a forced install is still
+  recoverable.
+
+The version is a *claim* the manifest makes, never a measurement — the payload's
+real ~VERSION~ register cannot be read until the image is flashed and booted. So
+this gate is a cheap policy check on an assertion, which is exactly why it is
+the one thing an operator may overrule.
+
+* The design in one page
+
+** Flash map
+
+| Region     | Address range          | Written by                          |
+|------------+------------------------+-------------------------------------|
+| Golden     | ~0x000000~             | JTAG only, never in the field       |
+| Update     | ~0x700000~..~0xFF0000~ | the updater, guarded                |
+| Boot state | ~0xFF0000~             | its own accessors, no address taken |
+
+The write guard inside the flash layer refuses every address below ~0x700000~
+and takes no force argument, so no bug in the updater can reach golden. A
+power-on reset clears the MultiBoot register, so a power cycle always returns to
+golden regardless of what the previous boot armed.
+
+** Roles
+
+One binary serves both roles. Which one it is running as is a runtime question,
+answered by the MultiBoot slot index — never by a build flag.
+
+- *GOLDEN* — the mission. Serves the control channel and performs updates.
+- *UPDATE* — proves itself. Arms a watchdog, checks the payload is alive, and
+  commits only then. Three failed attempts and the arbiter routes back to golden.
+
+** The update pipeline
+
+Fetch manifest, check the version, check whether the slot already holds this
+image, fetch the image, hash it, check it is a boot image, invalidate the slot,
+erase and program, read back and re-hash, commit. Full contract with the
+reasoning for the ordering: [[file:doc/icd_updater.org][the updater ICD]].
+
+The ordering is the safety property. Nothing gives up the installed update until
+the replacement has been hashed in DDR, and nothing marks the new image good
+until it has been read back out of flash and hashed again.
+
+* Configuring it for your bench
+
+| What                | Where                                                      |
+|---------------------+------------------------------------------------------------|
+| Board IP            | ~BOARD_IP_*~ in ~sw/arty_updater/main.c~                   |
+| TFTP server IP      | ~TFTP_SRV_*~ in ~sw/arty_updater/main.c~                   |
+| Board IP, host side | ~BOARD_IP~ environment variable, or ~host/ctrl.sh~ default |
+| TFTP root           | ~host/setup_tftp.sh~                                       |
+| Payload version     | ~PAYLOAD_VERSION_*~ in ~project.mk~                        |
+
+The defaults are a private ~192.168.1.0/24~ bench. Change them before first use.
+
+* Documentation
+
+| Document                                     | What it covers                          |
+|----------------------------------------------+-----------------------------------------|
+| [[file:host/README.org][host/README.org]]                     | host dependencies and the TFTP server   |
+| [[file:doc/icd_updater.org][icd_updater.org]]             | the update pipeline and manifest format |
+| [[file:doc/icd_boot_arbiter.org][icd_boot_arbiter.org]]   | the FSBL hook and the boot state record |
+| [[file:doc/icd_control_channel.org][icd_control_channel.org]] | the four operator verbs over UDP        |
+| [[file:doc/icd_blinkctl.org][icd_blinkctl.org]]           | the payload peripheral's register map   |
+| [[file:doc/verified_behaviour.org][verified_behaviour.org]]   | what was proven under fault injection   |
+
+* Recovery
+
+JP4 to JTAG bypasses the boot chain entirely. No state in flash can prevent it.
+That is the unconditional recovery path and it is why this design is safe to
+experiment with.
+
+* Licence
+
+Apache License 2.0 — see [[file:LICENSE][LICENSE]]. Lift what is useful; the
+patent grant is deliberate, since this is meant to end up in hardware.
+
+Three ~platform.h~ files are Xilinx's and the ~vivado/board_files/~ definitions
+are Digilent's, redistributed under their own terms. [[file:NOTICE][NOTICE]]
+lists them. ~mk/~ is a submodule with its own licence.

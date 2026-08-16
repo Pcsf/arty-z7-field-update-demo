@@ -1,0 +1,78 @@
+# Build artifacts
+build/
+
+# Generated Makefile fragments (auto-scanned)
+**/Makefile.mk
+
+# GHDL simulation outputs
+*.vcd
+*.wlf
+*.log
+*.jou
+*.hwdef
+*.sim
+*.wdb
+
+# Vivado project files
+*.xpr
+*.runs/
+*.srcs/
+*.gen/
+*.ip_user_files/
+*.cache/
+*.hw/
+*.backup/
+*.mpf
+*.xc
+
+# Non-Project Mode writes an in-memory project's output products into the
+# CURRENT directory. The make targets cd into build/ first, so these should
+# never reach the repo root — but a hand-run vivado will put them there.
+/.gen/
+/.srcs/
+
+# XSIM simulation outputs
+xsim.dir/
+xsim*.log
+*.pb
+*.wdb
+
+# Vivado scratch dir — empty today, so git ignores it implicitly, but it shows
+# up as untracked the moment Vivado writes anything into it
+.Xil/
+
+# Vitis project files
+*.workspace
+*.cproject
+*.project
+*.elf
+*.bin
+*.bit
+*.mcs
+
+# IDE files
+.idea/
+.vscode/
+
+# Release artifacts
+*.scr
+*.itb
+
+# Vivado writes an "NA/" dir when a project property is unset
+NA/
+
+# Vivado crash dumps
+hs_err_pid*.log
+
+# Session hand-off notes — local only, never committed.
+HANDOFF.md
+
+# Campaign evidence is a deliverable, not a build artifact. The *.log rule above
+# would swallow it, and the earlier entries in doc/fault_campaign.md cite console
+# captures under /tmp that no longer exist — evidence that evaporates is evidence
+# nobody can check. Captures committed here are the exception, deliberately.
+!doc/logs/
+!doc/logs/*.log
+
+# built by `make manifest-test`
+test/manifest/.test_manifest

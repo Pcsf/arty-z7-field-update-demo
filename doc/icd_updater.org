@@ -1,0 +1,326 @@
+#+TITLE: Field updater — the nine-step update pipeline
+#+OPTIONS: toc:2 num:nil
+
+* Updater — ICD (Interface Control Document)
+
+*Module:* Bare-metal field updater — fetches, verifies, and installs an update
+~BOOT.BIN~ into the QSPI update slot on Arty Z7 (Case B)
+*Runs in:* the golden image's application, and again inside the update image
+(same code, different role — see *Roles*)
+*Companion:* [[icd_boot_arbiter.md][~icd_boot_arbiter.md~]] — the FSBL-side contract
+this one hands off to. The arbiter decides *which* image boots; this decides *what
+gets installed*.
+
+Reconciled against the code that implements it on hardware. Where an earlier
+design note and the shipped
+code disagree, the code is authoritative and the difference is called out.
+
+---
+
+** Roles
+
+The same updater binary runs in both images and must behave differently in each.
+It learns which one it is from the arbiter's primitive, never from a build flag:
+
+#+begin_src c
+if (multiboot_slot_index() == 0) { /* GOLDEN — the updater is the mission */ }
+else                             { /* UPDATE — self-check, then commit   */ }
+#+end_src
+
+*Golden role.* No valid update installed, or the update failed its attempts.
+Serve: bring up the network, wait for an operator trigger, run the pipeline below.
+
+*Update role.* The arbiter has already incremented ~boot_attempts~ and armed the
+watchdog. Prove health (PL heartbeat moving, N seconds stable), write
+~boot_attempts = 0~, then service the watchdog for the rest of runtime. A hang
+before the commit is the fallback path working as designed.
+
+A build flag would be a second source of truth for the same fact and would drift
+from the register the way an earlier design note drifted from hardware.
+
+---
+
+** Physical Boundary
+
+| Interface | Detail |
+|---+---|
+| Network | PS GEM0, RTL8211E PHY via MIO. The PL is not in the Ethernet path on this board. |
+| Flash | PS QSPI (~XQspiPs~), 16 MB serial NOR, 3-byte addressing |
+| Payload target | PL bitstream inside the update ~BOOT.BIN~; health probed via ~blinkctl~ over M_AXI_GP0 at ~0x43C0_0000~ (see [[icd_blinkctl.md][~icd_blinkctl.md~]]) |
+| Console | UART0, 115200 8N1 — the abort reason is part of the deliverable, not debug output |
+| Watchdog | SWDT, armed by the arbiter in the update role only |
+
+---
+
+** Flash Memory Map — and who may write each region
+
+| Region | Range | Written by | *Side effects / rules* |
+|---+---+---+---|
+| GOLDEN ~BOOT.BIN~ | ~0x000000~ – ~0x6FFFFF~ | *nobody, in the field* | Written once, over JTAG, at factory programming. ~qspi_flash_program()~ refuses this range at every call site. This refusal is the entire anti-brick argument of Case B. |
+| UPDATE slot | ~0x700000~ – ~0xFEFFFF~ | the updater | The only region the pipeline erases or programs. Capacity ~0x8F0000~ (8.94 MB). Erase granularity 64 KB — a partial-sector update is not possible, so length is always rounded up to a sector boundary. |
+| BOOT STATE sector | ~0xFF0000~ – ~0xFFFFFF~ | arbiter *and* updater | One 64 KB sector holding ~boot_state_t~. *Side effect: every write costs one full sector erase.* Written at most once per boot per writer; see *Endurance* below. |
+
+*Implemented today:* ~qspi_flash_program()~ and ~qspi_flash_erase_sector()~
+range-check ~[QSPI_WRITE_FLOOR, QSPI_WRITE_CEIL)~ = ~[0x700000, 0xFF0000)~ and
+return ~QSPI_ERR_RANGE~ otherwise — ~sw/lib/qspi/qspi_flash.c~.
+There is no force argument by design.
+
+*** The state sector needs its own accessor — the guard deliberately excludes it
+
+~QSPI_WRITE_CEIL~ is ~0xFF0000~, so **the shipped flash-write path refuses the
+boot-state sector.** That is intentional in the `qspi` example (its header says so: the
+ceiling keeps that app off the sector so the record is defined on erased
+flash), but it leaves a gap in the contract, because two writers need that sector:
+
+- the arbiter, incrementing ~boot_attempts~ on every update boot,
+- the updater, clearing ~update_present~ at step 5 and committing at step 8.
+
+~icd_boot_arbiter.md~ states the guarantee as "flash-write function asserts
+~addr >= 0x700000 && addr < 0xFF0000~" while also requiring ~write_boot_state()~.
+Both cannot hold through one function. This is the same class of defect as
+an earlier design note — a contract that reads correctly until something executes it.
+
+*Resolution — two windows, two functions, neither able to reach the other's:*
+
+| Function | Window | May write |
+|---+---+---|
+| ~qspi_flash_program()~ / ~qspi_flash_erase_sector()~ | ~[0x700000, 0xFF0000)~ | update slot only — *unchanged* |
+| ~boot_state_write()~ | ~[0xFF0000, 0x1000000)~ | state sector only |
+
+Widening the existing window to ~0x1000000~ would have been one edit and is the
+wrong one: it would let a length-miscalculation in the image writer scribble the
+state record, which is the structure that decides what boots. Keeping them
+separate means a bug in the slot writer cannot corrupt boot state, and a bug in
+the state writer cannot corrupt an image. ~boot_state_write()~ is implemented
+alongside the record definition; ~qspi_flash.[ch]~ is not modified.
+
+---
+
+** The Pipeline
+
+Every ~&&~ in the Case A shell equivalent is an ~if~ with a logged abort. No step
+proceeds on a failure, and every abort names which step and which result code.
+
+| # | Step | Implemented by | Abort leaves |
+|---+---+---+---|
+| 1 | Bring up lwIP (static IP or DHCP) | ~examples/lwip_echo/~ | nothing touched |
+| 2 | ~tftp_get("update.sha")~ → parse ~{sha256, length, version}~ | ~tftp_client/tftp_client.c~ | nothing touched |
+| 2b | version policy: refuse a downgrade unless forced | ~arty_updater/updater.c~ | nothing touched |
+| 2c | hash the slot; skip if it holds this image *and the record agrees*, else check its header and jump to step 8 | ~arty_updater/updater.c~ | nothing touched |
+| 3 | ~tftp_get("update.bin")~ → DDR buffer | same | nothing touched |
+| 4 | ~sha256(DDR, length)~ == manifest? | ~sha256/sha256.c~ | *flash untouched* |
+| 5 | ~update_present = 0~ | ~boot_state_write()~ | slot marked invalid — golden boots, retry is safe |
+| 6 | erase ~[0x700000, roundup(length, 64K))~, then program from DDR | ~qspi_flash_erase_sector()~ / ~qspi_flash_program()~ | slot half-written, but ~update_present == 0~ |
+| 7 | read back from flash, ~sha256~ again == manifest? | ~qspi_flash_read()~ + ~sha256~ | slot bad and known bad |
+| 8 | ~update_present = 1~, ~boot_attempts = 0~ — *the commit* | ~boot_state_write()~ | — |
+| 9 | ~multiboot_to(0x700000)~ | ~sw/lib/multiboot/multiboot.c~ | does not return |
+
+*** Why step 5 precedes step 6 — the ordering IS the safety property
+
+Invalidate before touching the slot, never after. A power cut anywhere in step 6
+or 7 then leaves ~update_present == 0~, the arbiter does not redirect, golden
+boots, and the operator can simply re-run the update. If the flag were cleared
+after the write instead, the window between "slot is now garbage" and "flag says
+so" would be a brick waiting for bad timing.
+
+The arbiter never trusts a slot that has not passed step 7. ~update_present~ means
+"read back from flash and hashed equal", not "we finished writing".
+
+*** Why the golden image is unwritable in code rather than by discipline
+
+Step 6's write target is the slot base as a compile-time constant, and the range
+check is inside the flash functions, not at their call sites. A caller cannot opt
+out. The guide phrased this as a rule to follow; the `qspi` example made it a rule that
+cannot be broken, one phase early and deliberately — the guard was testable while
+the flash was still empty, which stops being true the moment a working golden
+image sits at offset 0.
+
+*** Manifest format (`update.sha`) — format 1
+
+Key/value lines, one pair per line, *order-independent*, produced host-side per
+release:
+
+#+begin_src text
+manifest 1
+sha256 <64 lowercase hex digits>
+length <decimal byte count>
+version 0x<8 hex digits>
+#+end_src
+
+| Key | Meaning |
+|---+---|
+| ~manifest~ | The format version. A board that does not speak it *refuses*. |
+| ~sha256~ | Digest of the whole image. Integrity, and (step 2c) identity. |
+| ~length~ | What step 4 hashes over and step 6 rounds up. Not redundant with the transfer size — a mismatch against the received count is a truncation, which must abort rather than hash a short buffer. |
+| ~version~ | What the payload's ~VERSION~ register is *expected* to read. |
+
+*All four are required. Unknown keys are refused, not ignored*, and that is the
+reason the format changed rather than growing a third positional line. The
+previous parser stopped after the length's digits, so it ignored anything that
+followed: a board running old firmware would have read a versioned manifest,
+skipped the version and installed anyway. Applied to a signature rather than a
+version, that is not an inconvenience — it is the whole attack. Image signing is
+therefore format 2, and a format-1 board declines it loudly rather than quietly
+verifying nothing.
+
+#+begin_quote
+**`version` is a claim, not a measurement.** The payload's real `VERSION` lives
+#+end_quote
+#+begin_quote
+in an AXI register that cannot be read until the image has been flashed and
+#+end_quote
+#+begin_quote
+booted, so nothing on the board can check the manifest's assertion at install
+#+end_quote
+#+begin_quote
+time. It is trustworthy enough to decide *whether to bother installing* and is
+#+end_quote
+#+begin_quote
+deliberately load-bearing for nothing else. Identity questions are answered by
+#+end_quote
+#+begin_quote
+`sha256`, which the board can and does verify.
+#+end_quote
+
+The old two-line format is refused with `no 'manifest <n>' on the first line
+(pre-format-1 manifest?)` rather than a generic parse error, because host and
+board move together and the likeliest cause is a stale ~release.sh~.
+
+#+begin_src sh
+bootgen -arch zynq -image update.bif -o update.bin -w on
+printf 'manifest 1\nsha256 %s\nlength %s\nversion %s\n' \
+       "$(sha256sum update.bin | awk '{print $1}')" \
+       "$(stat -c %s update.bin)" \
+       "$(make -s print-UPDATE_VERSION)" > update.sha
+cp update.bin update.sha /srv/tftp/
+#+end_src
+
+~host/release.sh~ does exactly this. The version is asked of ~make~ rather than
+written into the script: ~project.mk~ declares what each payload's ~VERSION~
+register reads, and a second copy of that number would be a second source of
+truth for the one value the board compares against.
+
+*** Steps 2b and 2c — is this worth installing?
+
+Everything else in the pipeline asks whether the
+bytes are *intact*; nothing asked whether they are *wanted*, so the board
+would erase 4.3 MB, program it, verify it twice, reboot and commit — to arrive at
+the version it was already running.
+
+| Step | Question | On yes |
+|---+---+---|
+| 2b | Is ~version~ lower than ~boot_state.installed_version~? | Refuse, unless the operator sent ~UPDATE FORCE~. |
+| 2c | Does the update slot already hash to ~sha256~? | Skip the whole pipeline, *if the boot state also records it as installed at this version*. If not, check the slot's boot header and go straight to step 8. |
+
+Both run *before step 3*, so a rejected update costs neither the download nor
+the flash cycle, and both run *before step 5*, which is the property that
+matters: step 5 is where the installed update is given up, and a refusal that
+costs a working slot is not a refusal.
+
+Order is version-then-hash because the version test is free and the hash test
+reads 4.3 MB out of QSPI.
+
+*2c asks the identity question with the digest, not the version*, because the
+version cannot answer it honestly — two different images may declare the same
+version, and the digest *is* the image's identity. A match means the slot holds
+these exact bytes. A slot read failure is not fatal there: it only means the
+shortcut is unavailable, and the full pipeline rewrites the slot anyway.
+
+*But a digest match proves the bytes, not the record.* Step 6 writes the image
+and step 8 records it, and a reset between them leaves a slot that is complete
+and a record that calls it empty. Such a board refuses ~SWITCH~ for having no
+update and refuses ~UPDATE~ for already having it — the two verbs consult
+different sources of truth, and when those disagree there is no operator verb
+left to break the tie. So the skip requires the record to agree: ~update_present
+== 1~ *and* ~installed_version == version~. Where it does not, 2c re-checks the
+slot's boot header (step 4b's question, asked of flash, since there is no DDR
+copy to look at) and then performs step 8 — completing the interrupted run at no
+download and no wear cycle. A slot whose header does not check out is left
+exactly as it is, record included; nothing is written on the strength of a digest
+alone.
+
+~UPDATE FORCE~ relaxes 2b and nothing else. It does not touch the hash, the
+length, the boot-header check or the read-back, and there is deliberately no
+argument anywhere in this API that can switch those off — it overrules a
+*policy*, which is the only thing an operator should be able to overrule from the
+network. It also does not defeat 2c: re-installing bytes already in the slot
+cannot be what anyone means by forcing. Nor does it need to — where the record
+disagrees with the slot, 2c commits rather than skips, so recovering a board
+stranded mid-install takes a plain ~UPDATE~.
+
+---
+
+** Error & Recovery Contract
+
+| Condition | Detection | Required behaviour |
+|---+---+---|
+| Server absent / link not up | ~tftp_get~ returns after its RRQ retry budget (~30 s; ~TFTP_RRQ_MAX_RETRIES~) | Report and stay in golden. Never a boot dependency. |
+| Transfer fails mid-download | ~tftp_result_t != TFTP_OK~ | Abort at step 3. Flash untouched. ~*out_len~ is 0 and the buffer contents are undefined — do not hash them. |
+| Image larger than the DDR buffer | ~TFTP_ERR_TOOBIG~ | Abort. The client refuses to write a truncated prefix, so there is no partial-success case to handle. |
+| Image larger than the slot | ~length > 0x8F0000~ | Abort *before* step 5 — do not invalidate a good slot for an image that cannot fit. |
+| Manifest in an unknown format | step 2 | Abort, naming the format. Never half-read. Flash untouched. |
+| Manifest declares an older version | step 2b | Abort unless ~UPDATE FORCE~. Flash untouched, ~update_present~ unchanged. |
+| Slot already holds this exact image, and the record says so | step 2c | Skip steps 3-8 and report success. Flash untouched, no wear cycle spent. |
+| Slot holds this exact image but the record does not say so | step 2c | Re-check the slot's boot header, then perform step 8. Flash untouched, no wear cycle spent, board recovered. A failed header check leaves everything as found. |
+| Hash mismatch on download | step 4 | Abort. Flash untouched. |
+| Hash mismatch on read-back | step 7 | Leave ~update_present = 0~. Slot is bad and marked bad. Report; golden remains bootable. |
+| Power cut during erase or program | next boot | ~update_present == 0~ ⇒ arbiter boots golden ⇒ re-update succeeds. Test twice: once during erase, once during program — the flash signatures differ. |
+| Power cut after the program finishes, before step 8 | next boot | ~update_present == 0~ ⇒ arbiter boots golden. The slot is complete, so a re-update matches at 2c and completes the commit instead of skipping. |
+| Flash controller error | any ~qspi_result_t~ other than ~QSPI_OK~ | Abort at that step, print ~qspi_result_str()~. Distinct causes stay distinct; "flash error" is not an acceptable console line. |
+| Update image boots but hangs | watchdog, in the update role | Arbiter increments ~boot_attempts~ each attempt; at ~BOOT_ATTEMPTS_MAX~ it routes back to golden. Covered by ~icd_boot_arbiter.md~. |
+| Both a bad slot and a bad state record | bad magic or bad CRC | Treated as ~{update_present=0, boot_attempts=0}~ and rewritten — factory-fresh flash boots golden by construction. |
+
+*Unconditional recovery, always:* JP4 to JTAG. It bypasses the boot chain
+entirely and no state in flash can prevent it.
+
+---
+
+** Safety Guarantees
+
+- Golden is never a write target: enforced inside the flash functions, no force
+  argument, verified by the `qspi` example against a live part.
+- ~update_present~ is set only after read-back verification, so no power cut can
+  activate a slot that was never proven.
+- Slot writes and state writes go through different functions with disjoint
+  address windows; neither can reach the other's region.
+- A POR clears ~DEVCFG_MULTIBOOT~, so a power cycle always re-enters golden
+  regardless of what the previous boot armed — demonstrated on hardware with
+  ~PORB~ versus ~SRST~ (the `multiboot` example).
+- The updater is reachable in the golden role over the network, so a failed
+  update is re-flashable without touching the board.
+
+*** Endurance
+
+The state sector is written at most twice per boot (arbiter increment, updater
+commit), one 64 KB erase each. At ~100 k erase cycles that is decades at any sane
+boot rate. A production design would ping-pong two sectors; this one does not, and
+records that as a deliberate limit rather than an oversight.
+
+---
+
+** What this ICD does not cover
+
+Bitstream authenticity. TFTP is unauthenticated and SHA-256 is an integrity check,
+not a signature — anything that can reach the TFTP server can serve an image that
+hashes correctly against its own manifest. Signed updates are a possible extension
+1. Do not let the presence of a hash read as a security property.
+
+---
+
+** Provenance
+
+Every pipeline step is implemented and hardware-proven by one of the standalone
+examples; the updater composes them rather than re-deriving them:
+
+| Step | Module | Proven in |
+|---+---+---|
+| 1 | ~lwip_echo/~ | the `lwip_echo` example (see the RTL8211E PHY defect noted in README) |
+| 2, 3 | ~tftp_client/~ — ~tftp_get()~ | the `tftp_client` example |
+| 4, 7 | ~sha256/~ — ~sha256()~, ~sha256_hex()~ | the `sha256` example |
+| 6, 7 | ~qspi/~ — ~qspi_flash_{erase_sector,program,read}()~ | the `qspi` example |
+| 9 | ~multiboot/~ — ~multiboot_to()~, ~multiboot_slot_index()~ | the `multiboot` example |
+| 5, 8 | ~boot_state_read()~, ~boot_state_write()~ | ~sw/lib/bootstate/~ |
+
+The Vitis ~lwip211_v1_6~ BSP
+ships ~tftp_server.c~ only, with no client entry point, so ~tftp_client.c~ is a
+raw-UDP RRQ client written for this project. See README § *TFTP client*.

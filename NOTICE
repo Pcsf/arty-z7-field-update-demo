@@ -1,0 +1,34 @@
+Arty Z7 field-update demo
+Copyright 2026 Paulo Ficagna
+
+Licensed under the Apache License, Version 2.0 (the "License"); you may not use
+this work except in compliance with the License. A copy is in the LICENSE file
+at the root of this repository.
+
+--------------------------------------------------------------------------------
+THIRD-PARTY CONTENT
+
+This repository redistributes files from third parties, which remain under their
+own copyright and terms. They are unmodified except where noted.
+
+Xilinx, Inc. -- Copyright (C) 2009-2019, BSD 3-clause, terms in each file header
+
+    sw/arty_updater/platform.h
+    examples/lwip_echo/platform.h
+    examples/tftp_client/platform.h
+
+  Local overrides of the Vitis lwIP Echo Server template's platform.h. Only
+  ETH_LINK_DETECT_INTERVAL differs from the stock file; the reason is in the
+  file header.
+
+Digilent, Inc. -- Copyright (c) 2021
+
+    vivado/board_files/arty-z7-20/A.0/board.xml
+    vivado/board_files/arty-z7-20/A.0/part0_pins.xml
+    vivado/board_files/arty-z7-20/A.0/preset.xml
+
+  Digilent's Arty Z7-20 board definition, used unmodified to derive the PS7
+  configuration preset.
+
+The build framework in mk/ is a git submodule
+(github.com/Pcsf/makefile_project_template) and carries its own licence.

@@ -1,0 +1,39 @@
+// golden.bif — Arty Z7 GOLDEN BOOT.BIN (Case B), QSPI offset 0x000000
+//
+// The image that is never rewritten in the field. Case B's whole anti-brick
+// argument reduces to that sentence: qspi_flash_program() refuses every address
+// below 0x700000, so the updater cannot reach this image even if it tries, and a
+// POR clears MULTIBOOT_ADDR so a power cycle always returns here regardless of
+// what the previous boot armed.
+//
+// Three partitions, and the order matters — the BootROM loads [bootloader] and
+// nothing else, so the FSBL is first:
+//
+//   fsbl.elf      the HOOKED FSBL: stock 2021.2 FSBL with sw/arty_fsbl_hooks/
+//                 overlaid at build time via VITIS_BOOT_SRC. Carries the boot
+//                 arbiter. The SAME binary is in update.bif -- one arbiter, two
+//                 images, and which role it plays is a runtime question it asks
+//                 the MultiBoot slot index.
+//
+//   blinkctl_v1   VERSION 0x0001_0001, 1 Hz. The "before" of the demo, and the
+//                 thing a successful update visibly replaces.
+//
+//   updater.elf   the field updater, also the same binary in both images. Here
+//                 it runs in its GOLDEN role, where it is the mission rather
+//                 than a self-check.
+//
+// Paths are repo-root-relative: bootgen resolves them from where make runs,
+// which is the project root.
+//
+// NOT compressed, deliberately. Measured, this image is 4.08 MB against a
+// 7.00 MB slot -- 58.3% used. Compression would buy margin that is already
+// spare while adding one more transformation between the bitstream Vivado
+// writes and the bytes in flash. See the guide's verify-before-trusting list,
+// item 5.
+
+the_ROM_image:
+{
+  [bootloader] build/vitis_ws/ps_plat/zynq_fsbl/fsbl.elf
+  build/boot/blinkctl_v1.bit
+  build/vitis_ws/updater/Debug/updater.elf
+}
