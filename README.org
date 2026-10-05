@@ -46,6 +46,7 @@ cd arty-z7-field-update-demo
 
 ./host/setup_tftp.sh                 # once, on the host
 
+make test                            # blinkctl testbench; exit status is the verdict
 make DESIGN=ps payload-bitstreams    # both payload versions, v1 and v2
 make DESIGN=ps xsa                   # hardware platform
 make DESIGN=ps vitis-platform        # BSP + FSBL, with the arbiter overlaid
